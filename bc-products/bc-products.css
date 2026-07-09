@@ -1,0 +1,481 @@
+/*
+ * bc-products — styles for the <bc-products> custom element.
+ * All colors/sizes/type live in --bc-* tokens on `bc-products` and are overridable.
+ * Light is the default; dark is opt-in via bc-products[data-theme="dark"] only.
+ * Everything is scoped under the bc-products tag / .bc-* classes so host-page CSS
+ * cannot bleed in or out, and this stylesheet never uses !important (see design
+ * doc §4 — light DOM relies on scoping alone, not specificity wars).
+ */
+
+bc-products {
+  --bc-surface: #ffffff;
+  --bc-surface-tile: #f4f5f7;
+  --bc-border: #e4e7ec;
+  --bc-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.08);
+  --bc-text: #16191f;
+  --bc-text-muted: #5b6472;
+  --bc-kicker: #6b7280;
+  --bc-sale: #c1121f;
+  --bc-sale-on: #ffffff;
+  --bc-link: #1257d6;
+  --bc-focus: #1257d6;
+  --bc-focus-width: 2px;
+  --bc-focus-offset: 2px;
+  --bc-touch: 44px;
+  --bc-skeleton-base: #e9edf2;
+  --bc-skeleton-sheen: #f4f7fa;
+  --bc-radius: 14px;
+  --bc-radius-card: 10px;
+  --bc-radius-sm: 6px;
+  --bc-border-w: 1px;
+  --bc-sp-1: 4px;
+  --bc-sp-2: 8px;
+  --bc-sp-3: 12px;
+  --bc-sp-4: 16px;
+  --bc-sp-5: 20px;
+  --bc-sp-6: 24px;
+  --bc-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --bc-fs-kicker: 0.6875rem;
+  --bc-fs-title: 1.15rem;
+  --bc-fs-name: 0.8125rem;
+  --bc-fs-price: 0.9375rem;
+  --bc-fs-badge: 0.6875rem;
+
+  --bc-bar-h: 3px;
+
+  /* Per-store accent: a single color supplied inline via data-accent (see bc-products.js).
+     Deliberately UNSET here so the var() fallbacks fire: no bar + neutral --bc-kicker text
+     when absent; the element sets --bc-accent inline only when data-accent is provided. */
+  /* Reference values already contrast-checked against --bc-surface (light) / dark surface
+     for kicker text (>=4.5:1) — pass one via style="--bc-accent: var(--bc-store-boardsports)". */
+  --bc-store-boardsports: #8a6d00;
+  --bc-store-toy: #6d28d9;
+
+  /* Reserved height so the box never resizes between :not(:defined), loading and ready.
+     --bc-cols is set inline by bc-products.js from data-columns; --bc-rows stays fixed
+     at its CSS default below for EVERY config instead of being computed from data-count —
+     CSS cannot know the real card count before bc-products.js runs, so a --bc-rows that
+     differed between the pre-upgrade skeleton and the ready state would itself cause the
+     shift this whole reserve exists to prevent. The default of 2 rows gives a compact
+     scrollable box: with the library's own default (count:8, columns:2) only 4 cards fit
+     without scrolling and the rest scroll inside the fixed-height .bc-scroll box; other
+     counts either leave scrollable whitespace (fewer cards) or scroll the same way (more
+     cards) — both are visually fine and, unlike a per-count row count, cause zero layout
+     shift.
+     --bc-head-h reserves the header (kicker + up-to-2-line title) so it doesn't shift
+     layout when it appears in the ready/empty/error states; --bc-sp-4 is its margin-bottom.
+     --bc-pad mirrors the host padding so the reserve tracks it (incl. the ≤480px override).
+     The host is box-sizing:border-box, so --bc-reserve-h (a min-height) must include the
+     host's own padding (2×--bc-pad) + border (2×--bc-border-w) to equal the ready-state
+     intrinsic outer height — otherwise the pre-ready box under-reserves by exactly that
+     box (~42px) and the content shifts it on render.
+     --bc-h-lg / --bc-h-sm are optional author overrides, set as inline custom properties on
+     the element (e.g. style="--bc-h-lg: 600px; --bc-h-sm: 420px"). Set these two, NOT --bc-h
+     itself: an inline --bc-h beats every breakpoint's media query (inline styles always outrank
+     stylesheet rules, and nothing here uses !important), so it would pin one fixed height at all
+     viewport widths instead of letting the ≤768px value differ. Feeding the two source vars lets
+     the stylesheet pick the right one per breakpoint. Absent either one, --bc-h falls back to the
+     calc() below unchanged. --bc-reserve-h derives from --bc-h, so an override keeps the zero-CLS
+     reserve in sync automatically — see README "Custom block height (advanced)". */
+  --bc-pad: var(--bc-sp-5);
+  --bc-cols: 2;
+  --bc-rows: 2;
+  --bc-card-h: 230px;
+  --bc-gap: 16px;
+  --bc-head-h: 56px;
+  --bc-h: var(--bc-h-lg, calc(var(--bc-rows) * var(--bc-card-h) + (var(--bc-rows) - 1) * var(--bc-gap)));
+  --bc-reserve-h: calc(2 * var(--bc-pad) + 2 * var(--bc-border-w) + var(--bc-head-h) + var(--bc-sp-4) + var(--bc-h));
+
+  display: block;
+  position: relative;
+  min-width: 0;
+  box-sizing: border-box;
+  font-family: var(--bc-font);
+  color: var(--bc-text);
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  text-align: start;
+  background: var(--bc-surface);
+  border: var(--bc-border-w) solid var(--bc-border);
+  border-radius: var(--bc-radius);
+  box-shadow: var(--bc-shadow);
+  padding: var(--bc-pad);
+}
+bc-products *,
+bc-products *::before,
+bc-products *::after {
+  box-sizing: border-box;
+}
+
+/* Decorative top accent bar — purely visual, driven by --bc-accent alone. */
+bc-products::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline: 0;
+  height: var(--bc-bar-h);
+  background: var(--bc-accent, transparent);
+  border-start-start-radius: var(--bc-radius);
+  border-start-end-radius: var(--bc-radius);
+  pointer-events: none;
+}
+
+bc-products[data-theme="dark"] {
+  --bc-surface: #16181d;
+  --bc-surface-tile: #1e2128;
+  --bc-border: #2a2e37;
+  --bc-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.35);
+  --bc-text: #e8eaed;
+  --bc-text-muted: #9aa4b2;
+  --bc-kicker: #98a2b3;
+  --bc-sale: #ff6b6b;
+  --bc-sale-on: #16181d;
+  --bc-link: #7aa2ff;
+  --bc-focus: #7aa2ff;
+  --bc-skeleton-base: #242832;
+  --bc-skeleton-sheen: #2e333e;
+  --bc-store-boardsports: #e6b400;
+  --bc-store-toy: #b794f6;
+}
+
+/* A single data-accent can't pass WCAG AA contrast on both a light and a dark surface
+   at once, so dark mode prefers a separate data-accent-dark (parsed by config-attrs.js,
+   applied as --bc-accent-dark by bc-products.js) when the integrator supplies one, then
+   falls back to the light --bc-accent, then the same neutral default the light theme
+   uses. Light theme's own kicker/bar rules below are unaffected by this override. */
+bc-products[data-theme="dark"] .bc-block__kicker {
+  color: var(--bc-accent-dark, var(--bc-accent, var(--bc-kicker)));
+}
+bc-products[data-theme="dark"]::before {
+  background: var(--bc-accent-dark, var(--bc-accent, transparent));
+}
+
+/* Skeleton shown from SYNC CSS before the async script upgrades the element
+   (:not(:defined)), and again while the defined-but-fetching element is still empty
+   (data-state="loading" — bc-products.js renders no skeleton markup, so the same
+   shimmer applies directly to the host to avoid a flash of unstyled emptiness).
+   min-height reserves the TOTAL later outer size (host padding + border + header +
+   its margin + scroll box) so nothing shifts when the real content renders -> zero CLS. */
+bc-products:not(:defined),
+bc-products[data-state="loading"] {
+  min-height: var(--bc-reserve-h);
+  background:
+    linear-gradient(90deg, transparent, var(--bc-skeleton-sheen), transparent) 0 0 / 40% 100% no-repeat,
+    var(--bc-skeleton-base);
+  border-radius: var(--bc-radius);
+  animation: bc-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes bc-shimmer {
+  0% {
+    background-position: -60% 0;
+  }
+  100% {
+    background-position: 160% 0;
+  }
+}
+
+.bc-block__head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--bc-sp-1) var(--bc-sp-3);
+  margin-bottom: var(--bc-sp-4);
+}
+.bc-block__kicker {
+  flex: 0 0 100%;
+  margin: 0;
+  font-size: var(--bc-fs-kicker);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--bc-accent, var(--bc-kicker));
+}
+.bc-block__title {
+  margin: 0;
+  margin-inline-end: auto;
+  font-size: var(--bc-fs-title);
+  font-weight: 700;
+  color: var(--bc-text);
+}
+.bc-block__viewall {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--bc-sp-1);
+  min-height: var(--bc-touch);
+  padding-inline: var(--bc-sp-1);
+  font-size: var(--bc-fs-name);
+  font-weight: 600;
+  color: var(--bc-link);
+  text-decoration: none;
+  white-space: nowrap;
+  border-radius: var(--bc-radius-sm);
+}
+.bc-block__viewall:hover {
+  text-decoration: underline;
+}
+.bc-block__viewall:focus-visible {
+  outline: var(--bc-focus-width) solid var(--bc-focus);
+  outline-offset: var(--bc-focus-offset);
+}
+
+/* Reserved height (min = max) keeps the box CLS-safe while enabling internal scroll;
+   this is what bc-products.js's updateScrollable() measures via scrollHeight/clientHeight. */
+.bc-scroll {
+  min-height: var(--bc-h);
+  max-height: var(--bc-h);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-radius: var(--bc-radius-sm);
+  scrollbar-width: thin;
+}
+.bc-scroll:focus-visible {
+  outline: var(--bc-focus-width) solid var(--bc-focus);
+  outline-offset: var(--bc-focus-offset);
+}
+
+.bc-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--bc-cols, 2), minmax(0, 1fr));
+  gap: var(--bc-gap);
+}
+
+.bc-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: var(--bc-card-h);
+  border-radius: var(--bc-radius-card);
+}
+.bc-card:focus-within {
+  outline: var(--bc-focus-width) solid var(--bc-focus);
+  outline-offset: var(--bc-focus-offset);
+}
+.bc-card__media {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  margin-bottom: var(--bc-sp-2);
+  background: var(--bc-surface-tile);
+  border: 1px solid var(--bc-border);
+  border-radius: var(--bc-radius-sm);
+  overflow: hidden;
+}
+.bc-card__img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.bc-card__img--fallback {
+  visibility: hidden;
+}
+/* :has() lets the wrapper paint a "broken image" placeholder from the img's own
+   modifier class — bc-products.js puts --fallback on the <img> itself, not a wrapper. */
+.bc-card__media:has(.bc-card__img--fallback)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(135deg, transparent 45%, var(--bc-border) 45%, var(--bc-border) 55%, transparent 55%),
+    var(--bc-surface-tile);
+  opacity: 0.6;
+}
+
+.bc-card__body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+.bc-card__title {
+  margin: 0;
+  font: inherit;
+}
+
+/* Real anchor carries the title text; ::after stretches it over the whole card. */
+.bc-card__link {
+  color: var(--bc-text);
+  text-decoration: none;
+  font-size: var(--bc-fs-name);
+  font-weight: 500;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: calc(var(--bc-fs-name) * 1.4 * 2); /* reserve 2 lines => uniform card height */
+  outline: none;
+}
+.bc-card__link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.bc-card__link:hover {
+  color: var(--bc-link);
+}
+
+.bc-price {
+  margin-top: auto;
+  padding-top: var(--bc-sp-2);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--bc-sp-1) var(--bc-sp-2);
+  font-size: var(--bc-fs-price);
+  font-weight: 700;
+  color: var(--bc-text);
+}
+.bc-price--sale .bc-price__now {
+  font-weight: 700;
+  color: var(--bc-sale);
+}
+.bc-price--sale .bc-price__was {
+  color: var(--bc-text-muted);
+  text-decoration: line-through;
+  font-size: 0.85em;
+  font-weight: 400;
+}
+.bc-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: var(--bc-radius-sm);
+  background: var(--bc-sale);
+  color: var(--bc-sale-on);
+  font-size: var(--bc-fs-badge);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+/* Fill the reserved scroll height and center the note so thin blocks aren't a
+   tall blank rectangle — still occupies the full box, so CLS is unaffected. */
+.bc-note {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  min-height: 100%;
+  gap: var(--bc-sp-3);
+  padding: var(--bc-sp-5) var(--bc-sp-2);
+  color: var(--bc-text-muted);
+  font-size: var(--bc-fs-name);
+}
+.bc-note__link,
+.bc-note__retry {
+  color: var(--bc-link);
+  font-weight: 600;
+}
+.bc-note__link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--bc-touch);
+  padding-block: var(--bc-sp-2);
+  padding-inline: var(--bc-sp-1);
+  border-radius: var(--bc-radius-sm);
+}
+.bc-note__retry {
+  min-height: var(--bc-touch);
+  padding: var(--bc-sp-2) var(--bc-sp-4);
+  background: transparent;
+  border: 1px solid var(--bc-border);
+  border-radius: var(--bc-radius-sm);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.bc-note__retry:focus-visible,
+.bc-note__link:focus-visible {
+  outline: var(--bc-focus-width) solid var(--bc-focus);
+  outline-offset: var(--bc-focus-offset);
+}
+
+.bc-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Hover lift only where a real pointer exists. */
+@media (hover: hover) {
+  .bc-card {
+    transition: transform 0.15s ease;
+  }
+  .bc-card:hover {
+    transform: translateY(-2px);
+  }
+}
+
+/* Cards stay 2-up at every breakpoint (a single <bc-products> never collapses to
+   one column — that keeps the --bc-rows reserved-height assumption valid). Narrow
+   screens only shrink the per-card metrics so two cards still fit legibly. */
+@media (max-width: 768px) {
+  bc-products {
+    --bc-card-h: 210px;
+    --bc-gap: 12px;
+    --bc-head-h: 52px;
+    --bc-h: var(--bc-h-sm, var(--bc-h-lg, calc(var(--bc-rows) * var(--bc-card-h) + (var(--bc-rows) - 1) * var(--bc-gap))));
+  }
+}
+@media (max-width: 480px) {
+  bc-products {
+    --bc-card-h: 190px;
+    --bc-gap: 10px;
+    --bc-fs-name: 0.75rem;
+    --bc-fs-price: 0.875rem;
+    --bc-pad: var(--bc-sp-4);
+    --bc-h: var(--bc-h-sm, var(--bc-h-lg, calc(var(--bc-rows) * var(--bc-card-h) + (var(--bc-rows) - 1) * var(--bc-gap))));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  bc-products:not(:defined),
+  bc-products[data-state="loading"] {
+    animation: none;
+    background: var(--bc-skeleton-base);
+  }
+  .bc-card {
+    transition: none;
+  }
+  .bc-card:hover {
+    transform: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  bc-products {
+    --bc-border: #99a1ae;
+  }
+  bc-products[data-theme="dark"] {
+    --bc-border: #4a5160;
+  }
+  .bc-card:focus-within,
+  .bc-scroll:focus-visible,
+  .bc-block__viewall:focus-visible,
+  .bc-note__retry:focus-visible,
+  .bc-note__link:focus-visible {
+    outline-width: 3px;
+  }
+}
+
+@media (forced-colors: active) {
+  bc-products,
+  .bc-card__media {
+    border-color: CanvasText;
+  }
+  bc-products::before {
+    background-color: CanvasText;
+  }
+  .bc-card:focus-within,
+  .bc-scroll:focus-visible,
+  .bc-block__viewall:focus-visible,
+  .bc-note__retry:focus-visible,
+  .bc-note__link:focus-visible {
+    outline-color: Highlight;
+  }
+}
