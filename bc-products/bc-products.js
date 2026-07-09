@@ -177,14 +177,22 @@
   
   /* Reduce product-description HTML to a short plain-text blurb. DOM-free (string
      + regex only, this module has no `document`; a textarea-decode would reintroduce
-     an XSS surface via `</textarea>` breakout). Entities are decoded BEFORE the
-     collapse/cut, so lengths + word boundaries track the real visible text and
-     truncation can never split a partial `&...;` sequence. */
+     an XSS surface via `</textarea>` breakout). Tags are stripped, then entities are
+     decoded, then tags are stripped AGAIN — some BC descriptions store their markup
+     entity-encoded (`&lt;h2&gt;…`), so decoding reveals real tags the first strip
+     could not see. Each tag is replaced by a space, not removed outright, so
+     adjacent-tag boundaries (`</h2><p>`, encoded or not) don't fuse the surrounding
+     words; the following collapse folds the extra spaces. A rare unpaired literal
+     `<`/`>` in prose survives (no closing bracket -> no match); that's inert under
+     textContent rendering and never throws. Decoding runs BEFORE the collapse/cut,
+     so lengths + word boundaries track real visible text and truncation can never
+     split a partial `&...;` sequence. */
   function summarize(html, max = 120) {
     if (typeof html !== 'string' || html === '') return '';
     const text = html
-      .replace(/<[^>]*>/g, '')
+      .replace(/<[^>]*>/g, ' ')
       .replace(ENTITY_RE, decodeEntity)
+      .replace(/<[^>]*>/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
     if (text.length <= max) return text;
