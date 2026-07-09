@@ -73,8 +73,14 @@
     return sale != null && base > 0 ? Math.round((1 - sale / base) * 100) : null;
   }
   
-  const NODE_FIELDS =
+  /* Node selection set. `description` is opt-in (data-description="true") so the
+     default query payload stays lean — see nodeFields(withDescription). */
+  const BASE_NODE_FIELDS =
     'entityId name path defaultImage { url(width: 320) } prices { price { value currencyCode } salePrice { value } basePrice { value } }';
+  
+  function nodeFields(withDescription) {
+    return withDescription ? `${BASE_NODE_FIELDS} description` : BASE_NODE_FIELDS;
+  }
   
   /* Abort a stalled request so the caller reaches the error/Retry state instead of
      spinning on the skeleton forever. */
@@ -99,8 +105,8 @@
     }
   }
   
-  async function fetchNew({ storeUrl, key, poolSize }) {
-    const query = `query($n:Int!){ site { newestProducts(first:$n){ edges { node { ${NODE_FIELDS} } } } } }`;
+  async function fetchNew({ storeUrl, key, poolSize, description }) {
+    const query = `query($n:Int!){ site { newestProducts(first:$n){ edges { node { ${nodeFields(description)} } } } } }`;
     const data = await gql(storeUrl, key, query, { n: poolSize });
     const nodes = (data?.site?.newestProducts?.edges || []).map((e) => e.node);
     return dedupeById(nodes.filter((n) => hasValidPrice(n) && hasSafePath(n)));
@@ -109,13 +115,13 @@
   /* searchProducts' categoryEntityIds + searchSubCategories filters expand the whole
      root-plus-descendant union server-side in one call (verified live: 5 roots ->
      408 products), so no separate categoryTree lookup is needed to enumerate ids. */
-  async function fetchSale({ storeUrl, key, categoryIds, subcategories }) {
+  async function fetchSale({ storeUrl, key, categoryIds, subcategories, description }) {
     const categoryEntityIds = categoryIds || [];
     if (!categoryEntityIds.length) return [];
     /* Sale fetches one fixed 50-newest page then client-filters to on-sale items —
        one page stays well under the 10000-point complexity limit while still
        filling the display count. */
-    const query = `query($ids:[Int!], $sub:Boolean){ site { search { searchProducts(filters:{ categoryEntityIds:$ids, searchSubCategories:$sub }, sort: NEWEST){ products(first:50){ edges { node { ${NODE_FIELDS} } } } } } } }`;
+    const query = `query($ids:[Int!], $sub:Boolean){ site { search { searchProducts(filters:{ categoryEntityIds:$ids, searchSubCategories:$sub }, sort: NEWEST){ products(first:50){ edges { node { ${nodeFields(description)} } } } } } } }`;
     const data = await gql(storeUrl, key, query, { ids: categoryEntityIds, sub: !!subcategories });
     const nodes = (data?.site?.search?.searchProducts?.products?.edges || []).map((e) => e.node);
     return dedupeById(nodes.filter((n) => hasValidPrice(n) && isOnSale(n) && hasSafePath(n)));
@@ -131,8 +137,65 @@
     return fmt;
   }
   
+  /* Named HTML entities BigCommerce descriptions commonly emit (typographic +
+     Latin-1 accents). Numeric entities are decoded generically in decodeEntity,
+     so only names need listing here. */
+  const NAMED_ENTITIES = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '…',
+    ndash: '–', mdash: '—', lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”',
+    laquo: '«', raquo: '»', trade: '™', reg: '®', copy: '©', deg: '°', middot: '·',
+    bull: '•', times: '×', divide: '÷', frac12: '½', frac14: '¼', frac34: '¾',
+    sect: '§', para: '¶', euro: '€', pound: '£', cent: '¢',
+    eacute: 'é', Eacute: 'É', egrave: 'è', Egrave: 'È', agrave: 'à', Agrave: 'À',
+    acirc: 'â', Acirc: 'Â', ecirc: 'ê', Ecirc: 'Ê', ccedil: 'ç', Ccedil: 'Ç',
+    ntilde: 'ñ', Ntilde: 'Ñ', uuml: 'ü', Uuml: 'Ü', ouml: 'ö', Ouml: 'Ö',
+    auml: 'ä', Auml: 'Ä', aacute: 'á', Aacute: 'Á', oacute: 'ó', Oacute: 'Ó',
+    iacute: 'í', Iacute: 'Í', uacute: 'ú', Uacute: 'Ú', szlig: 'ß',
+  };
+  
+  const ENTITY_RE = /&(#[xX][0-9a-fA-F]+|#\d+|[A-Za-z][A-Za-z0-9]*);/g;
+  
+  /* Decode one entity token. Numeric decimal (`&#233;`) and hex (`&#x2013;`) are
+     resolved via code point; a named token uses NAMED_ENTITIES. Unknown names and
+     invalid/out-of-range code points return the ORIGINAL match untouched so a stray
+     `&#xZZ;` / `&#9999999999;` / `&notAnEntity;` survives verbatim and never throws. */
+  function decodeEntity(match, body) {
+    if (body[0] === '#') {
+      const hex = body[1] === 'x' || body[1] === 'X';
+      const code = parseInt(body.slice(hex ? 2 : 1), hex ? 16 : 10);
+      if (code > 0 && code <= 0x10ffff) {
+        try {
+          return String.fromCodePoint(code);
+        } catch {
+          return match;
+        }
+      }
+      return match;
+    }
+    return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, body) ? NAMED_ENTITIES[body] : match;
+  }
+  
+  /* Reduce product-description HTML to a short plain-text blurb. DOM-free (string
+     + regex only, this module has no `document`; a textarea-decode would reintroduce
+     an XSS surface via `</textarea>` breakout). Entities are decoded BEFORE the
+     collapse/cut, so lengths + word boundaries track the real visible text and
+     truncation can never split a partial `&...;` sequence. */
+  function summarize(html, max = 120) {
+    if (typeof html !== 'string' || html === '') return '';
+    const text = html
+      .replace(/<[^>]*>/g, '')
+      .replace(ENTITY_RE, decodeEntity)
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (text.length <= max) return text;
+    const clipped = text.slice(0, max);
+    const lastSpace = clipped.lastIndexOf(' ');
+    return `${lastSpace > 0 ? clipped.slice(0, lastSpace) : clipped}…`;
+  }
+  
   /* Raw card model — no formatting here; the renderer formats price/salePrice/
-     basePrice via getFormatter(model.currency) and decides Was/Now/badge markup. */
+     basePrice via getFormatter(model.currency) and decides Was/Now/badge markup.
+     `blurb` is '' unless the description field was fetched (data-description). */
   function toCardModel(node, storeUrl) {
     const onSale = isOnSale(node);
     const img = node.defaultImage?.url;
@@ -147,10 +210,11 @@
       basePrice: node.prices?.basePrice?.value ?? null,
       onSale,
       badge: onSale ? saleBadge(node) : null,
+      blurb: summarize(node.description),
     };
   }
   
-  const core = { shuffle, dedupeById, hasValidPrice, isOnSale, isSafeHttpUrl, isStoreRelativePath, hasSafePath, saleBadge, gql, fetchNew, fetchSale, getFormatter, toCardModel };
+  const core = { shuffle, dedupeById, hasValidPrice, isOnSale, isSafeHttpUrl, isStoreRelativePath, hasSafePath, saleBadge, gql, fetchNew, fetchSale, getFormatter, summarize, toCardModel };
   
   const ATTR_DEFAULTS = { count: 8, poolSize: 40, columns: 2, subcategories: true, theme: 'light' };
   const TYPES = new Set(['new', 'sale']);
@@ -195,6 +259,7 @@
         poolSize: intAttr(d.poolSize, ATTR_DEFAULTS.poolSize, MAX_POOL_SIZE),
         columns: intAttr(d.columns, ATTR_DEFAULTS.columns),
         subcategories: d.subcategories !== 'false',
+        description: d.description === 'true',
         theme,
         accent: d.accent || '',
         accentDark: d.accentDark || '',
@@ -276,6 +341,7 @@
     title.appendChild(link);
     body.appendChild(title);
     body.appendChild(buildPrice(model));
+    if (model.blurb) body.appendChild(el('p', 'bc-card__desc', model.blurb));
     card.appendChild(body);
   
     return card;
