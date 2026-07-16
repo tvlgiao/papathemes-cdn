@@ -287,7 +287,7 @@
     wasLabel: 'Was ',
     nowLabel: 'Now ',
     saleText: 'Sale',
-    viewAll: 'View all',
+    viewAll: 'View more',
     viewAllArrow: '→',
   };
   
