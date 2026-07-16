@@ -263,6 +263,7 @@
         storeLabel: d.storeLabel || '',
         title,
         viewAll: d.viewAll || '',
+        viewAllText: (d.viewAllText || '').trim(),
         count: intAttr(d.count, ATTR_DEFAULTS.count),
         poolSize: intAttr(d.poolSize, ATTR_DEFAULTS.poolSize, MAX_POOL_SIZE),
         columns: intAttr(d.columns, ATTR_DEFAULTS.columns),
@@ -360,9 +361,10 @@
     if (config.storeLabel) head.appendChild(el('p', 'bc-block__kicker', config.storeLabel));
     head.appendChild(el('h2', 'bc-block__title', config.title));
     if (config.viewAll) {
-      const viewAll = el('a', 'bc-block__viewall', `${STRINGS.viewAll} ${STRINGS.viewAllArrow}`);
+      const text = config.viewAllText || STRINGS.viewAll;
+      const viewAll = el('a', 'bc-block__viewall', `${text} ${STRINGS.viewAllArrow}`);
       viewAll.href = config.viewAll;
-      viewAll.setAttribute('aria-label', `${STRINGS.viewAll} ${label}`.trim());
+      viewAll.setAttribute('aria-label', `${text} ${label}`.trim());
       head.appendChild(viewAll);
     }
     return head;
