@@ -219,12 +219,15 @@ bc-products[data-state="loading"] {
 }
 
 /* Reserved height (min = max) keeps the box CLS-safe while enabling internal scroll;
-   this is what bc-products.js's updateScrollable() measures via scrollHeight/clientHeight. */
+   this is what bc-products.js's updateScrollable() measures via scroll/client size.
+   overscroll-behavior stays `auto` so reaching the end of the inner list chains the
+   scroll on to the page — `contain` here dead-stopped page scrolling whenever the
+   pointer/finger happened to be over the block. */
 .bc-scroll {
   min-height: var(--bc-h);
   max-height: var(--bc-h);
   overflow-y: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior: auto;
   border-radius: var(--bc-radius-sm);
   scrollbar-width: thin;
 }
@@ -425,15 +428,50 @@ bc-products[data-state="loading"] {
   }
 }
 
-/* Cards stay 2-up at every breakpoint (a single <bc-products> never collapses to
-   one column — that keeps the --bc-rows reserved-height assumption valid). Narrow
-   screens only shrink the per-card metrics so two cards still fit legibly. */
+/* Narrow screens keep the same --bc-rows-tall box but turn it on its side: cards flow
+   left-to-right in 2 fixed rows and the box swipes horizontally. The height formula is
+   deliberately untouched (still --bc-rows * --bc-card-h + gaps), so --bc-h,
+   --bc-reserve-h and the --bc-h-sm/--bc-h-lg override chain all keep working and the
+   zero-CLS reserve holds for free. Narrow screens also shrink the per-card metrics. */
 @media (max-width: 768px) {
   bc-products {
     --bc-card-h: 210px;
     --bc-gap: 12px;
     --bc-head-h: 52px;
     --bc-h: var(--bc-h-sm, var(--bc-h-lg, calc(var(--bc-rows) * var(--bc-card-h) + (var(--bc-rows) - 1) * var(--bc-gap))));
+    /* ~1.5 cards per row width, so the next card peeks and the swipe is discoverable. */
+    --bc-card-w: calc((100% - 1.5 * var(--bc-gap)) / 1.5);
+  }
+  /* X is contained so a swipe can't escape into the browser's back-navigation gesture;
+     Y stays auto so vertical page scrolling still chains — that is the whole point. */
+  .bc-scroll {
+    /* Same value min-height/max-height already pin, but stated as a definite `height`
+       so the grid's percentage height below has something to resolve against. */
+    height: var(--bc-h);
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior: contain auto;
+    scroll-snap-type: x proximity;
+    scroll-behavior: smooth;
+  }
+  /* Rows divide the box rather than being pinned to var(--bc-card-h). With the default
+     --bc-h the two are identical ((--bc-h - gap) / 2 == --bc-card-h exactly), but this
+     way a --bc-h-sm override spends its extra height on the cards instead of leaving a
+     blank strip under them, and a classic (space-consuming) scrollbar shrinks the rows
+     gracefully instead of clipping the bottom one. */
+  .bc-grid {
+    grid-auto-flow: column;
+    grid-template-columns: none;
+    grid-template-rows: repeat(var(--bc-rows), minmax(0, 1fr));
+    grid-auto-columns: var(--bc-card-w);
+    height: 100%;
+  }
+  /* The row track already sizes the card, so its own min-height would only let a long
+     name/price push it past the row height and spill out of the box. */
+  .bc-card {
+    min-height: 0;
+    overflow: hidden;
+    scroll-snap-align: start;
   }
 }
 @media (max-width: 480px) {
@@ -458,6 +496,10 @@ bc-products[data-state="loading"] {
   }
   .bc-card:hover {
     transform: none;
+  }
+  /* Undo the mobile carousel's smooth keyboard/programmatic scrolling. */
+  .bc-scroll {
+    scroll-behavior: auto;
   }
 }
 

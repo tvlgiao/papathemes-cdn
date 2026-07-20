@@ -391,10 +391,14 @@
     return scroll;
   }
   
-  /* Querying scrollHeight/clientHeight forces a synchronous layout, so this reads
-     accurately right after the DOM is attached — no need to wait a frame. */
+  /* Querying scroll/client size forces a synchronous layout, so this reads accurately
+     right after the DOM is attached — no need to wait a frame. Both axes are checked:
+     the box scrolls vertically on desktop but is a horizontal carousel at <=768px, and
+     measuring height alone would leave the mobile carousel unreachable by keyboard. */
   function updateScrollable(scroll) {
-    if (scroll.scrollHeight > scroll.clientHeight) scroll.setAttribute('tabindex', '0');
+    const overflows =
+      scroll.scrollHeight > scroll.clientHeight || scroll.scrollWidth > scroll.clientWidth;
+    if (overflows) scroll.setAttribute('tabindex', '0');
     else scroll.removeAttribute('tabindex');
   }
   
