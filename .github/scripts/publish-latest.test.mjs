@@ -86,6 +86,21 @@ test('ensureTag succeeds when the last rejected push lost to a tag on this same 
     assert.strictEqual(ensureTag({ ...repo.io('bbb'), attempts: 3 }), 'v1.0.8');
 });
 
+test('ensureTag does not tag a head that main moved past during the run', () => {
+    const repo = fakeRepo({ 'v1.0.5': 'aaa', 'v1.0.6': 'ccc' });
+    assert.strictEqual(ensureTag({ ...repo.io('bbb'), isCurrent: () => false }), null);
+    assert.deepStrictEqual(repo.pushes, []);
+});
+
+test('ensureTag stops retrying once main has moved on', () => {
+    let current = true;
+    const repo = fakeRepo({ 'v1.0.5': 'aaa' }, {
+        racer: remote => { remote['v1.0.6'] = 'zzz'; current = false; },
+    });
+    assert.strictEqual(ensureTag({ ...repo.io('bbb'), isCurrent: () => current }), null);
+    assert.deepStrictEqual(repo.pushes, ['v1.0.6']);
+});
+
 test('ensureTag gives up after the attempts are used', () => {
     const repo = fakeRepo({}, { racer: remote => { remote[`v1.0.${Object.keys(remote).length}`] = 'other'; } });
     assert.throws(() => ensureTag({ ...repo.io('bbb'), attempts: 3 }), /Could not tag bbb after 3 attempts/);

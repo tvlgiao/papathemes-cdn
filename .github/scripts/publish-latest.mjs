@@ -10,6 +10,8 @@ import { pathToFileURL } from 'node:url';
 const REPO = 'tvlgiao/papathemes-cdn';
 const CDN = `https://cdn.jsdelivr.net/gh/${REPO}@latest/`;
 const PURGE = `https://purge.jsdelivr.net/gh/${REPO}@latest`;
+/** Ref (not a tag, so jsDelivr ignores it) at the last commit whose changed files were verified live. */
+const VERIFIED_REF = 'refs/published/latest';
 
 /** Run git and return trimmed stdout. */
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
@@ -49,10 +51,11 @@ export function nextTag(tags) {
  * publisher may tag concurrently, so a rejected push re-reads the remote tags and either reuses the
  * tag now on `head` or tries the next number.
  * @param {{ head: string, fetchTags: () => void, listTags: () => string[], tagsAt: (sha: string) => string[],
- *   createAndPush: (tag: string, sha: string) => void, log?: Function, attempts?: number }} io
- * @returns {string} the tag on `head`
+ *   createAndPush: (tag: string, sha: string) => void, isCurrent?: () => boolean, log?: Function,
+ *   attempts?: number }} io
+ * @returns {string|null} the tag on `head`, or null when `head` stopped being the branch tip
  */
-export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, log = console.log, attempts = 5 }) {
+export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, isCurrent = () => true, log = console.log, attempts = 5 }) {
     // Only the highest version moves @latest; a non-semver or older tag on head would leave it behind.
     const reusable = () => {
         fetchTags();
@@ -62,6 +65,11 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, lo
     for (let i = 1; i <= attempts; i++) {
         const existing = reusable();
         if (existing) return existing;
+        // A newer commit may have reached main (and a newer tag) since the run started.
+        if (!isCurrent()) {
+            log(`${head.slice(0, 7)} is no longer the tip of main; not tagging it.`);
+            return null;
+        }
         const tag = nextTag(listTags());
         try {
             createAndPush(tag, head);
@@ -143,6 +151,10 @@ async function main() {
         fetchTags: () => git('fetch', '--tags', '--force', 'origin'),
         listTags,
         tagsAt,
+        isCurrent: () => {
+            git('fetch', 'origin', 'main');
+            return git('rev-parse', 'origin/main') === head;
+        },
         createAndPush: (name, sha) => {
             git('tag', '-a', name, sha, '-m', `publish ${sha.slice(0, 7)}`);
             try {
@@ -158,19 +170,39 @@ async function main() {
         },
     });
 
-    const headTags = tagsAt(head);
-    const prev = highestTag(listTags().filter(t => !headTags.includes(t)));
+    if (!tag) return;
+
+    // Diff from the last commit whose files were verified live, not from the previous tag: a failed
+    // run leaves its tag behind, and diffing from it would skip files that never went live.
+    let base;
+    try {
+        git('fetch', 'origin', `+${VERIFIED_REF}:${VERIFIED_REF}`);
+        base = git('rev-parse', VERIFIED_REF);
+    } catch {
+        const headTags = tagsAt(head);
+        base = highestTag(listTags().filter(t => !headTags.includes(t)));
+    }
     // "A\tpath" / "M\tpath" / "D\tpath"; a deleted path must stop being served.
-    const changes = (prev
-        ? git('diff', '--name-status', '--no-renames', '--diff-filter=AMD', prev, head)
+    const changes = (base
+        ? git('diff', '--name-status', '--no-renames', '--diff-filter=AMD', base, head)
         : git('ls-tree', '-r', '--name-only', head).split('\n').map(f => `A\t${f}`).join('\n'))
         .split('\n')
         .filter(Boolean)
         .map(line => line.split('\t'))
         .filter(([, f]) => f && !f.startsWith('.github/'));
     const files = changes.map(([, f]) => f);
-    console.log(`${tag}: ${files.length} changed files since ${prev || 'the first commit'}.`);
-    if (!files.length) return;
+    console.log(`${tag}: ${files.length} changed files since ${base ? base.slice(0, 12) : 'the first commit'}.`);
+    const markVerified = () => {
+        try {
+            git('push', '--force', 'origin', `${head}:${VERIFIED_REF}`);
+        } catch (err) {
+            console.warn(`Could not record ${head.slice(0, 7)} as verified: ${firstLine(err)}`);
+        }
+    };
+    if (!files.length) {
+        markVerified();
+        return;
+    }
 
     const expected = Object.fromEntries(changes.map(([status, f]) =>
         [f, status === 'D' ? null : sha256(execFileSync('git', ['show', `${head}:${f}`]))]));
@@ -191,6 +223,7 @@ async function main() {
     if (stale.length) {
         throw new Error(`@latest still serves old bytes for ${stale.length} files:\n${stale.join('\n')}`);
     }
+    markVerified();
     console.log(`@latest serves ${tag} for all ${files.length} changed files.`);
 }
 
