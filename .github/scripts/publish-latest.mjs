@@ -107,9 +107,11 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
 }
 
 /**
- * Files changed from `base` to `head` as [status, path] pairs (A, M, T or D) with byte-exact
+ * Files to publish from `base` to `head` as [status, path] pairs (A, M, T or D) with byte-exact
  * paths; `.github/` is left out. T (a file turned into a symlink or back) is served differently,
- * so it is published like M.
+ * so it is published like M. Besides the net diff, every path any commit in `base..head` touched
+ * is included (M if `head` has it, else D): a tagged commit whose run failed may have left its
+ * bytes cached for a path that a later commit restored, which the net diff no longer shows.
  * @param {(...args: string[]) => string} run git runner returning raw stdout
  * @param {string} base
  * @param {string} head
@@ -118,11 +120,19 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
 export function changedFiles(run, base, head) {
     // -z: without it git prints a non-ASCII path quoted and escaped, which `git show` cannot find.
     const fields = run('diff', '--name-status', '--no-renames', '--diff-filter=AMDT', '-z', base, head).split('\0');
-    const pairs = [];
+    const status = new Map();
     for (let i = 0; i + 1 < fields.length; i += 2) {
-        if (fields[i + 1]) pairs.push([fields[i], fields[i + 1]]);
+        if (fields[i + 1]) status.set(fields[i + 1], fields[i]);
     }
-    return pairs.filter(([, f]) => !f.startsWith('.github/'));
+    const touched = run('log', '--no-renames', '--diff-merges=first-parent', '--name-only', '--format=', '-z', `${base}..${head}`)
+        .split('\0').filter(Boolean);
+    if (touched.some(f => !status.has(f))) {
+        const inHead = new Set(run('ls-tree', '-r', '--name-only', '-z', head).split('\0').filter(Boolean));
+        for (const f of touched) if (!status.has(f)) status.set(f, inHead.has(f) ? 'M' : 'D');
+    }
+    return [...status].map(([f, s]) => [s, f])
+        .sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
+        .filter(([, f]) => !f.startsWith('.github/'));
 }
 
 /**

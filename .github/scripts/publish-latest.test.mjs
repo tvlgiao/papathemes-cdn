@@ -395,3 +395,32 @@ test('purgeUntilLive starts no round after the deadline and reports what is stil
     assert.deepStrictEqual(stale, ['a.js']);
     assert.strictEqual(rounds, 3);
 });
+
+test('changedFiles keeps paths an intermediate commit touched even when the net diff does not show them', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'touched-'));
+    const run = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+    const commit = (msg) => {
+        run('add', '-A');
+        run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg);
+        return run('rev-parse', 'HEAD').trim();
+    };
+    try {
+        run('init', '-q');
+        writeFileSync(join(dir, 'foo.js'), 'verified');
+        writeFileSync(join(dir, 'keep.js'), '1');
+        const base = commit('verified');
+        // A tagged commit whose run failed: foo.js may be cached with these bytes; tmp.js was served.
+        writeFileSync(join(dir, 'foo.js'), 'failed run');
+        writeFileSync(join(dir, 'tmp.js'), '1');
+        commit('failed');
+        // The next commit restores foo.js and drops tmp.js: the net diff from base shows neither.
+        writeFileSync(join(dir, 'foo.js'), 'verified');
+        unlinkSync(join(dir, 'tmp.js'));
+        writeFileSync(join(dir, 'other.js'), '1');
+        const head = commit('restore');
+
+        assert.deepStrictEqual(changedFiles(run, base, head), [['M', 'foo.js'], ['A', 'other.js'], ['D', 'tmp.js']]);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
