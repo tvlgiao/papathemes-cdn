@@ -106,9 +106,14 @@ export async function purgeUntilLive({ files, expected, purge, purgeAlias, fetch
 }
 
 async function main() {
+    git('fetch', 'origin', 'main');
+    const head = git('rev-parse', 'HEAD');
+    // A run from any other checkout (a feature branch, a stale clone) would publish that commit as @latest.
+    if (head !== git('rev-parse', 'origin/main')) {
+        throw new Error(`HEAD ${head.slice(0, 7)} is not origin/main; refusing to tag it.`);
+    }
     git('config', 'user.name', 'papathemes-cdn publish');
     git('config', 'user.email', 'deploy@papathemes.com');
-    const head = git('rev-parse', 'HEAD');
     const listTags = () => git('tag', '-l', 'v*').split('\n').filter(Boolean);
     const tagsAt = sha => git('tag', '--points-at', sha).split('\n').filter(Boolean);
 
