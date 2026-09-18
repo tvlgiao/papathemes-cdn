@@ -127,6 +127,12 @@ async function main() {
     } catch {
         throw new Error(`HEAD ${head.slice(0, 7)} is not on origin/main; refusing to tag it.`);
     }
+    // Queued runs are not FIFO: tagging an older commit after a newer one would move @latest back.
+    // The newer commit contains this one and is published by its own run.
+    if (head !== git('rev-parse', 'origin/main')) {
+        console.log(`HEAD ${head.slice(0, 7)} is behind origin/main; the newer commit's run publishes it. Skipping.`);
+        return;
+    }
     git('config', 'user.name', 'papathemes-cdn publish');
     git('config', 'user.email', 'deploy@papathemes.com');
     const listTags = () => git('tag', '-l', 'v*').split('\n').filter(Boolean);
