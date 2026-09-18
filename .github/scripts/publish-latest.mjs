@@ -62,10 +62,23 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, lo
             log(`Tagged ${head.slice(0, 7)} as ${tag}.`);
             return tag;
         } catch (err) {
-            log(`Tag ${tag} rejected (${String(err.message).split('\n')[0]}), retrying.`);
+            log(`Tag ${tag} rejected (${firstLine(err)}), retrying.`);
         }
     }
     throw new Error(`Could not tag ${head} after ${attempts} attempts`);
+}
+
+/** First line of an error's message, for logs. */
+const firstLine = err => String((err && err.message) || err).split('\n')[0];
+
+/** Await `fn`, logging instead of throwing: one flaky request must not end the run. */
+async function attempt(fn, what, log) {
+    try {
+        return await fn();
+    } catch (err) {
+        log(`${what} failed: ${firstLine(err)}`);
+        return null;
+    }
 }
 
 /**
@@ -79,12 +92,12 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, lo
 export async function purgeUntilLive({ files, expected, purge, purgeAlias, fetchHash, sleep, rounds = 12, waitMs = 30000, log = console.log }) {
     let pending = [...files];
     for (let round = 1; round <= rounds && pending.length; round++) {
-        await purgeAlias();
-        for (const file of pending) await purge(file);
+        await attempt(purgeAlias, 'purge @latest alias', log);
+        for (const file of pending) await attempt(() => purge(file), `purge ${file}`, log);
         await sleep(waitMs);
         const stale = [];
         for (const file of pending) {
-            if ((await fetchHash(file)) !== expected[file]) stale.push(file);
+            if ((await attempt(() => fetchHash(file), `fetch ${file}`, log)) !== expected[file]) stale.push(file);
         }
         log(`Round ${round}: ${pending.length - stale.length}/${pending.length} live on @latest.`);
         pending = stale;
@@ -109,7 +122,11 @@ async function main() {
             try {
                 git('push', 'origin', `refs/tags/${name}`);
             } catch (err) {
-                git('tag', '-d', name);
+                try {
+                    git('tag', '-d', name);
+                } catch (cleanup) {
+                    console.warn(`Could not delete local tag ${name}: ${firstLine(cleanup)}`);
+                }
                 throw err;
             }
         },
@@ -124,13 +141,14 @@ async function main() {
     if (!files.length) return;
 
     const expected = Object.fromEntries(files.map(f => [f, sha256(execFileSync('git', ['show', `${head}:${f}`]))]));
+    const timeout = () => AbortSignal.timeout(20000);
     const stale = await purgeUntilLive({
         files,
         expected,
-        purge: async f => { await fetch(`${PURGE}/${encodeURI(f)}`); },
-        purgeAlias: async () => { await fetch(PURGE); },
+        purge: async f => { await fetch(`${PURGE}/${encodeURI(f)}`, { signal: timeout() }); },
+        purgeAlias: async () => { await fetch(PURGE, { signal: timeout() }); },
         fetchHash: async f => {
-            const resp = await fetch(CDN + encodeURI(f), { cache: 'no-store' });
+            const resp = await fetch(CDN + encodeURI(f), { cache: 'no-store', signal: timeout() });
             return resp.ok ? sha256(Buffer.from(await resp.arrayBuffer())) : null;
         },
         sleep: ms => new Promise(r => setTimeout(r, ms)),

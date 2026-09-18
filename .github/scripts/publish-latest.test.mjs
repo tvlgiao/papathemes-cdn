@@ -97,6 +97,23 @@ test('purgeUntilLive re-purges only the files still stale until all are live', a
     assert.strictEqual(aliasPurges, 3);
 });
 
+test('purgeUntilLive keeps going through failed purge and fetch requests', async () => {
+    let fetches = 0;
+    const stale = await purgeUntilLive({
+        files: ['a.js'],
+        expected: { 'a.js': 'new' },
+        purge: async () => { throw new Error('ECONNRESET'); },
+        purgeAlias: async () => { throw new Error('ETIMEDOUT'); },
+        fetchHash: async () => { if (++fetches < 3) throw new Error('socket hang up'); return 'new'; },
+        sleep: async () => {},
+        rounds: 5,
+        log: () => {},
+    });
+
+    assert.deepStrictEqual(stale, []);
+    assert.strictEqual(fetches, 3);
+});
+
 test('purgeUntilLive reports the files that never went live', async () => {
     const { stale } = await runPurge({ files: ['a.js', 'b.js'], liveAfter: { 'a.js': 1, 'b.js': 99 }, rounds: 4 });
 
