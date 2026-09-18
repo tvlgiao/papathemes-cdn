@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { highestTag, nextTag, ensureTag, purgeUntilLive, purgeRequest, changedFiles, verifiedBase } from './publish-latest.mjs';
+import { highestTag, nextTag, ensureTag, purgeUntilLive, purgeRequest, changedFiles, verifiedBase, blobSha256, cdnPath, sha256 } from './publish-latest.mjs';
 
 test('highestTag compares numerically and ignores non-semver tags', () => {
     assert.strictEqual(highestTag(['v1.0.9', 'v1.0.10', 'v1.0.2', 'release', 'v2']), 'v1.0.10');
@@ -197,7 +197,7 @@ test('purgeRequest resolves only when every provider purged the path', async () 
     await assert.rejects(purgeRequest('u', answer(200, { status: 'finished' })), /without a path/);
 });
 
-test('changedFiles returns byte-exact non-ASCII paths, leaves out .github, and lists every file without a base', () => {
+test('changedFiles returns byte-exact non-ASCII paths and type changes, leaves out .github, lists every file without a base', () => {
     const dir = mkdtempSync(join(tmpdir(), 'changed-files-'));
     // Force git's default path quoting, whatever the machine's config says.
     const run = (...args) => execFileSync('git', ['-C', dir, '-c', 'core.quotePath=true', ...args], { encoding: 'utf8' });
@@ -207,6 +207,7 @@ test('changedFiles returns byte-exact non-ASCII paths, leaves out .github, and l
         mkdirSync(join(dir, '.github'));
         writeFileSync(join(dir, '.github', 'w.yml'), '1');
         writeFileSync(join(dir, 'a.js'), '1');
+        writeFileSync(join(dir, 'b.js'), '1');
         writeFileSync(join(dir, 'naïve.js'), '1');
         const c1 = commit('c1');
         mkdirSync(join(dir, 'dir'));
@@ -214,10 +215,16 @@ test('changedFiles returns byte-exact non-ASCII paths, leaves out .github, and l
         writeFileSync(join(dir, 'naïve.js'), '2');
         writeFileSync(join(dir, '.github', 'w.yml'), '2');
         unlinkSync(join(dir, 'a.js'));
-        const c2 = commit('c2');
+        run('add', '-A');
+        // b.js becomes a symlink (mode 120000) without touching the file system: a type change, T.
+        const target = execFileSync('git', ['-C', dir, 'hash-object', '-w', '--stdin'], { input: 'naïve.js', encoding: 'utf8' }).trim();
+        run('update-index', '--cacheinfo', `120000,${target},b.js`);
+        run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'c2');
+        const c2 = run('rev-parse', 'HEAD').trim();
 
-        assert.deepStrictEqual(changedFiles(run, c1, c2), [['D', 'a.js'], ['A', 'dir/ünï cödé.js'], ['M', 'naïve.js']]);
-        assert.deepStrictEqual(changedFiles(run, undefined, c1), [['A', 'a.js'], ['A', 'naïve.js']]);
+        assert.deepStrictEqual(changedFiles(run, c1, c2),
+            [['D', 'a.js'], ['T', 'b.js'], ['A', 'dir/ünï cödé.js'], ['M', 'naïve.js']]);
+        assert.deepStrictEqual(changedFiles(run, undefined, c1), [['A', 'a.js'], ['A', 'b.js'], ['A', 'naïve.js']]);
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
@@ -284,4 +291,27 @@ test('verifiedBase reads the verified ref and ignores tags when the ref does not
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+test('blobSha256 hashes committed assets larger than the 1 MiB exec buffer', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'blob-sha-'));
+    const run = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+    try {
+        const big = Buffer.alloc(3 * 1024 * 1024, 'x');
+        run('init', '-q');
+        writeFileSync(join(dir, 'big.js'), big);
+        run('add', '-A');
+        run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'big');
+
+        assert.strictEqual(blobSha256('HEAD', 'big.js', dir), sha256(big));
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('cdnPath percent-encodes each segment and keeps the slashes', () => {
+    assert.strictEqual(cdnPath('app/scripts/a#b?c d%.js'), 'app/scripts/a%23b%3Fc%20d%25.js');
+    assert.strictEqual(cdnPath('dir/ünï.js'), 'dir/%C3%BCn%C3%AF.js');
+    assert.strictEqual(cdnPath('conditionalproductoptions/scripts/0.1.4/conditionalproductoptions.js'),
+        'conditionalproductoptions/scripts/0.1.4/conditionalproductoptions.js');
 });

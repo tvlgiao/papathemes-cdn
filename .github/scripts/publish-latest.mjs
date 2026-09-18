@@ -13,11 +13,32 @@ const PURGE = `https://purge.jsdelivr.net/gh/${REPO}@latest`;
 /** Ref (not a tag, so jsDelivr ignores it) at the last commit whose changed files were verified live. */
 const VERIFIED_REF = 'refs/published/latest';
 
+/** Largest git output held in memory; execFileSync's 1 MiB default is smaller than some assets. */
+const GIT_MAX_BUFFER = 1024 * 1024 * 1024;
+
 /** Run git and return trimmed stdout. */
-const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
+const git = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER }).trim();
 
 /** sha256 hex of a string or buffer. */
 export const sha256 = data => createHash('sha256').update(data).digest('hex');
+
+/**
+ * sha256 of the committed bytes of `path` at `commit`.
+ * @param {string} commit
+ * @param {string} path
+ * @param {string} [cwd] repository directory
+ * @returns {string}
+ */
+export const blobSha256 = (commit, path, cwd = '.') =>
+    sha256(execFileSync('git', ['cat-file', 'blob', `${commit}:${path}`], { cwd, maxBuffer: GIT_MAX_BUFFER }));
+
+/**
+ * URL path for a repository path: each segment percent-encoded, so `#`, `?` and `%` in a file name
+ * address that file instead of starting a fragment or a query.
+ * @param {string} path
+ * @returns {string}
+ */
+export const cdnPath = path => path.split('/').map(encodeURIComponent).join('/');
 
 /**
  * Highest `vX.Y.Z` tag, compared numerically.
@@ -87,7 +108,8 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
 
 /**
  * Files changed from `base` to `head`, or every file of `head` when there is no base, as
- * [status, path] pairs (A, M or D) with byte-exact paths; `.github/` is left out.
+ * [status, path] pairs (A, M, T or D) with byte-exact paths; `.github/` is left out. T (a file
+ * turned into a symlink or back) is served differently, so it is published like M.
  * @param {(...args: string[]) => string} run git runner returning raw stdout
  * @param {string|undefined} base
  * @param {string} head
@@ -96,7 +118,7 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
 export function changedFiles(run, base, head) {
     // -z: without it git prints a non-ASCII path quoted and escaped, which `git show` cannot find.
     const fields = base
-        ? run('diff', '--name-status', '--no-renames', '--diff-filter=AMD', '-z', base, head).split('\0')
+        ? run('diff', '--name-status', '--no-renames', '--diff-filter=AMDT', '-z', base, head).split('\0')
         : run('ls-tree', '-r', '--name-only', '-z', head).split('\0').flatMap(f => (f ? ['A', f] : []));
     const pairs = [];
     for (let i = 0; i + 1 < fields.length; i += 2) {
@@ -231,7 +253,7 @@ async function main() {
 
     if (!tag) return;
 
-    const run = (...args) => execFileSync('git', args, { encoding: 'utf8' });
+    const run = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
     const base = verifiedBase(run);
     if (!base) console.log(`${VERIFIED_REF} is missing; verifying every file.`);
     const changes = changedFiles(run, base, head);
@@ -250,15 +272,15 @@ async function main() {
     }
 
     const expected = Object.fromEntries(changes.map(([status, f]) =>
-        [f, status === 'D' ? null : sha256(execFileSync('git', ['show', `${head}:${f}`]))]));
+        [f, status === 'D' ? null : blobSha256(head, f)]));
     const timeout = () => AbortSignal.timeout(20000);
     const stale = await purgeUntilLive({
         files,
         expected,
-        purge: f => purgeRequest(`${PURGE}/${encodeURI(f)}`),
+        purge: f => purgeRequest(`${PURGE}/${cdnPath(f)}`),
         purgeAlias: () => purgeRequest(PURGE),
         fetchHash: async f => {
-            const resp = await fetch(CDN + encodeURI(f), { cache: 'no-store', signal: timeout() });
+            const resp = await fetch(CDN + cdnPath(f), { cache: 'no-store', signal: timeout() });
             if (resp.ok) return sha256(Buffer.from(await resp.arrayBuffer()));
             if (resp.status === 404) return null;
             throw new Error(`HTTP ${resp.status}`);
