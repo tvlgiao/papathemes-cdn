@@ -424,3 +424,35 @@ test('changedFiles keeps paths an intermediate commit touched even when the net 
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+test('changedFiles includes paths of tags published after base that a force push took off main', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'force-push-'));
+    const run = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+    const commit = (msg, tag) => {
+        run('add', '-A');
+        run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg);
+        if (tag) run('tag', tag);
+        return run('rev-parse', 'HEAD').trim();
+    };
+    try {
+        run('init', '-q');
+        writeFileSync(join(dir, 'keep.js'), '1');
+        const base = commit('verified', 'v1.0.0');
+        // An older tag on a side line: published before base, so it must not count.
+        writeFileSync(join(dir, 'old.js'), '1');
+        commit('side', 'v0.9.0');
+        run('reset', '-q', '--hard', base);
+        // A tagged run that failed after foo.js went out; main was then force-pushed past it.
+        writeFileSync(join(dir, 'foo.js'), '1');
+        commit('failed', 'v1.0.1');
+        run('reset', '-q', '--hard', base);
+        writeFileSync(join(dir, 'bar.js'), '1');
+        const head = commit('replacement', 'v1.0.2');
+        run('tag', 'v-not-semver', 'v1.0.1');
+
+        assert.deepStrictEqual(changedFiles(run, base, head),
+            [['A', 'bar.js'], ['D', 'foo.js']]);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});

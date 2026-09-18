@@ -109,9 +109,10 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
 /**
  * Files to publish from `base` to `head` as [status, path] pairs (A, M, T or D) with byte-exact
  * paths; `.github/` is left out. T (a file turned into a symlink or back) is served differently,
- * so it is published like M. Besides the net diff, every path any commit in `base..head` touched
- * is included (M if `head` has it, else D): a tagged commit whose run failed may have left its
- * bytes cached for a path that a later commit restored, which the net diff no longer shows.
+ * so it is published like M. Besides the net diff, every path touched by a commit after `base` on
+ * `head` or on a tag published after `base` is included (M if `head` has it, else D): a tagged
+ * commit whose run failed may have left its bytes cached for a path that a later commit restored,
+ * or that a force push to main took out of `head`'s history, and the net diff shows neither.
  * @param {(...args: string[]) => string} run git runner returning raw stdout
  * @param {string} base
  * @param {string} head
@@ -124,7 +125,11 @@ export function changedFiles(run, base, head) {
     for (let i = 0; i + 1 < fields.length; i += 2) {
         if (fields[i + 1]) status.set(fields[i + 1], fields[i]);
     }
-    const touched = run('log', '--no-renames', '--diff-merges=first-parent', '--name-only', '--format=', '-z', `${base}..${head}`)
+    const tagList = (...args) => run('tag', '-l', 'v*', ...args).split('\n').map(t => t.trim()).filter(Boolean);
+    const baseTop = highestTag(tagList('--merged', base));
+    // Semver tags above the highest one `base` contains (highestTag ignores any other tag).
+    const later = tagList().filter(t => t !== baseTop && highestTag(baseTop ? [t, baseTop] : [t]) === t);
+    const touched = run('log', '--no-renames', '--diff-merges=first-parent', '--name-only', '--format=', '-z', head, ...later, `^${base}`)
         .split('\0').filter(Boolean);
     if (touched.some(f => !status.has(f))) {
         const inHead = new Set(run('ls-tree', '-r', '--name-only', '-z', head).split('\0').filter(Boolean));
