@@ -67,6 +67,25 @@ test('ensureTag moves to the next number when a racer took the name for another 
     assert.strictEqual(repo.remote['v1.0.6'], 'zzz');
 });
 
+test('ensureTag does not reuse a non-semver tag on head: it would not move @latest', () => {
+    const repo = fakeRepo({ 'v1.0.5': 'aaa', 'release-x': 'bbb' });
+    assert.strictEqual(ensureTag(repo.io('bbb')), 'v1.0.6');
+    assert.strictEqual(repo.remote['v1.0.6'], 'bbb');
+});
+
+test('ensureTag does not reuse an older semver tag on head while a higher one exists', () => {
+    const repo = fakeRepo({ 'v1.0.3': 'bbb', 'v1.0.9': 'aaa' });
+    assert.strictEqual(ensureTag(repo.io('bbb')), 'v1.0.10');
+});
+
+test('ensureTag succeeds when the last rejected push lost to a tag on this same head', () => {
+    let pushes = 0;
+    const repo = fakeRepo({ 'v1.0.5': 'aaa' }, {
+        racer: remote => { pushes++; remote[`v1.0.${5 + pushes}`] = pushes === 3 ? 'bbb' : 'zzz'; },
+    });
+    assert.strictEqual(ensureTag({ ...repo.io('bbb'), attempts: 3 }), 'v1.0.8');
+});
+
 test('ensureTag gives up after the attempts are used', () => {
     const repo = fakeRepo({}, { racer: remote => { remote[`v1.0.${Object.keys(remote).length}`] = 'other'; } });
     assert.throws(() => ensureTag({ ...repo.io('bbb'), attempts: 3 }), /Could not tag bbb after 3 attempts/);
@@ -112,6 +131,38 @@ test('purgeUntilLive keeps going through failed purge and fetch requests', async
 
     assert.deepStrictEqual(stale, []);
     assert.strictEqual(fetches, 3);
+});
+
+test('purgeUntilLive accepts a deleted file once it answers 404, not while it still serves', async () => {
+    let served = 2;
+    const stale = await purgeUntilLive({
+        files: ['gone.js'],
+        expected: { 'gone.js': null },
+        purge: async () => {},
+        purgeAlias: async () => {},
+        fetchHash: async () => (served-- > 0 ? 'old-bytes' : null),
+        sleep: async () => {},
+        rounds: 5,
+        log: () => {},
+    });
+
+    assert.deepStrictEqual(stale, []);
+    assert.strictEqual(served, -1);
+});
+
+test('purgeUntilLive does not count a failed request as a deleted file being gone', async () => {
+    const stale = await purgeUntilLive({
+        files: ['gone.js'],
+        expected: { 'gone.js': null },
+        purge: async () => {},
+        purgeAlias: async () => {},
+        fetchHash: async () => { throw new Error('HTTP 503'); },
+        sleep: async () => {},
+        rounds: 3,
+        log: () => {},
+    });
+
+    assert.deepStrictEqual(stale, ['gone.js']);
 });
 
 test('purgeUntilLive reports the files that never went live', async () => {

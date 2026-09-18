@@ -45,17 +45,23 @@ export function nextTag(tags) {
 }
 
 /**
- * Tag `head` unless a tag already points at it. Another publisher may tag concurrently, so a
- * rejected push re-reads the remote tags and either reuses the tag now on `head` or tries the next.
+ * Make `head` carry the highest `vX.Y.Z` tag, creating the next one unless it already does. Another
+ * publisher may tag concurrently, so a rejected push re-reads the remote tags and either reuses the
+ * tag now on `head` or tries the next number.
  * @param {{ head: string, fetchTags: () => void, listTags: () => string[], tagsAt: (sha: string) => string[],
  *   createAndPush: (tag: string, sha: string) => void, log?: Function, attempts?: number }} io
  * @returns {string} the tag on `head`
  */
 export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, log = console.log, attempts = 5 }) {
-    for (let i = 1; i <= attempts; i++) {
+    // Only the highest version moves @latest; a non-semver or older tag on head would leave it behind.
+    const reusable = () => {
         fetchTags();
-        const existing = tagsAt(head);
-        if (existing.length) return existing[0];
+        const top = highestTag(listTags());
+        return tagsAt(head).find(t => t === top);
+    };
+    for (let i = 1; i <= attempts; i++) {
+        const existing = reusable();
+        if (existing) return existing;
         const tag = nextTag(listTags());
         try {
             createAndPush(tag, head);
@@ -65,11 +71,17 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, lo
             log(`Tag ${tag} rejected (${firstLine(err)}), retrying.`);
         }
     }
+    // The last rejection may have come from another publisher tagging this same head.
+    const existing = reusable();
+    if (existing) return existing;
     throw new Error(`Could not tag ${head} after ${attempts} attempts`);
 }
 
 /** First line of an error's message, for logs. */
 const firstLine = err => String((err && err.message) || err).split('\n')[0];
+
+/** Result of a request that failed; never equal to an expected hash or to "not served" (null). */
+const FAILED = Symbol('failed');
 
 /** Await `fn`, logging instead of throwing: one flaky request must not end the run. */
 async function attempt(fn, what, log) {
@@ -77,17 +89,18 @@ async function attempt(fn, what, log) {
         return await fn();
     } catch (err) {
         log(`${what} failed: ${firstLine(err)}`);
-        return null;
+        return FAILED;
     }
 }
 
 /**
- * Purge `files` on @latest until each serves `expected[file]`, re-purging each round:
- * jsDelivr can keep resolving @latest to the previous tag for a few minutes after a new one.
- * @param {{ files: string[], expected: Object.<string, string>, purge: (file: string) => Promise<void>,
+ * Purge `files` on @latest until each serves `expected[file]` (a sha256, or null for a deleted file
+ * that must answer 404), re-purging each round: jsDelivr can keep resolving @latest to the previous
+ * tag for a few minutes after a new one.
+ * @param {{ files: string[], expected: Object.<string, string|null>, purge: (file: string) => Promise<void>,
  *   purgeAlias: () => Promise<void>, fetchHash: (file: string) => Promise<string|null>,
  *   sleep: (ms: number) => Promise<void>, rounds?: number, waitMs?: number, log?: Function }} io
- * @returns {Promise<string[]>} files still not serving the committed bytes (empty on success)
+ * @returns {Promise<string[]>} files still not serving the committed state (empty on success)
  */
 export async function purgeUntilLive({ files, expected, purge, purgeAlias, fetchHash, sleep, rounds = 12, waitMs = 30000, log = console.log }) {
     let pending = [...files];
@@ -109,8 +122,10 @@ async function main() {
     git('fetch', 'origin', 'main');
     const head = git('rev-parse', 'HEAD');
     // A run from any other checkout (a feature branch, a stale clone) would publish that commit as @latest.
-    if (head !== git('rev-parse', 'origin/main')) {
-        throw new Error(`HEAD ${head.slice(0, 7)} is not origin/main; refusing to tag it.`);
+    try {
+        git('merge-base', '--is-ancestor', head, 'origin/main');
+    } catch {
+        throw new Error(`HEAD ${head.slice(0, 7)} is not on origin/main; refusing to tag it.`);
     }
     git('config', 'user.name', 'papathemes-cdn publish');
     git('config', 'user.email', 'deploy@papathemes.com');
@@ -139,13 +154,20 @@ async function main() {
 
     const headTags = tagsAt(head);
     const prev = highestTag(listTags().filter(t => !headTags.includes(t)));
-    const files = (prev ? git('diff', '--name-only', '--diff-filter=AM', prev, head) : git('ls-tree', '-r', '--name-only', head))
+    // "A\tpath" / "M\tpath" / "D\tpath"; a deleted path must stop being served.
+    const changes = (prev
+        ? git('diff', '--name-status', '--no-renames', '--diff-filter=AMD', prev, head)
+        : git('ls-tree', '-r', '--name-only', head).split('\n').map(f => `A\t${f}`).join('\n'))
         .split('\n')
-        .filter(f => f && !f.startsWith('.github/'));
+        .filter(Boolean)
+        .map(line => line.split('\t'))
+        .filter(([, f]) => f && !f.startsWith('.github/'));
+    const files = changes.map(([, f]) => f);
     console.log(`${tag}: ${files.length} changed files since ${prev || 'the first commit'}.`);
     if (!files.length) return;
 
-    const expected = Object.fromEntries(files.map(f => [f, sha256(execFileSync('git', ['show', `${head}:${f}`]))]));
+    const expected = Object.fromEntries(changes.map(([status, f]) =>
+        [f, status === 'D' ? null : sha256(execFileSync('git', ['show', `${head}:${f}`]))]));
     const timeout = () => AbortSignal.timeout(20000);
     const stale = await purgeUntilLive({
         files,
@@ -154,7 +176,9 @@ async function main() {
         purgeAlias: async () => { await fetch(PURGE, { signal: timeout() }); },
         fetchHash: async f => {
             const resp = await fetch(CDN + encodeURI(f), { cache: 'no-store', signal: timeout() });
-            return resp.ok ? sha256(Buffer.from(await resp.arrayBuffer())) : null;
+            if (resp.ok) return sha256(Buffer.from(await resp.arrayBuffer()));
+            if (resp.status === 404) return null;
+            throw new Error(`HTTP ${resp.status}`);
         },
         sleep: ms => new Promise(r => setTimeout(r, ms)),
     });
