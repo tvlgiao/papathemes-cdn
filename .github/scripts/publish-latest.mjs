@@ -107,24 +107,62 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
 }
 
 /**
- * Files changed from `base` to `head`, or every file of `head` when there is no base, as
- * [status, path] pairs (A, M, T or D) with byte-exact paths; `.github/` is left out. T (a file
- * turned into a symlink or back) is served differently, so it is published like M.
+ * Files changed from `base` to `head` as [status, path] pairs (A, M, T or D) with byte-exact
+ * paths; `.github/` is left out. T (a file turned into a symlink or back) is served differently,
+ * so it is published like M.
  * @param {(...args: string[]) => string} run git runner returning raw stdout
- * @param {string|undefined} base
+ * @param {string} base
  * @param {string} head
  * @returns {Array<[string, string]>}
  */
 export function changedFiles(run, base, head) {
     // -z: without it git prints a non-ASCII path quoted and escaped, which `git show` cannot find.
-    const fields = base
-        ? run('diff', '--name-status', '--no-renames', '--diff-filter=AMDT', '-z', base, head).split('\0')
-        : run('ls-tree', '-r', '--name-only', '-z', head).split('\0').flatMap(f => (f ? ['A', f] : []));
+    const fields = run('diff', '--name-status', '--no-renames', '--diff-filter=AMDT', '-z', base, head).split('\0');
     const pairs = [];
     for (let i = 0; i + 1 < fields.length; i += 2) {
         if (fields[i + 1]) pairs.push([fields[i], fields[i + 1]]);
     }
     return pairs.filter(([, f]) => !f.startsWith('.github/'));
+}
+
+/**
+ * Changes to publish when no verified base exists: every file of `head` as A, plus D for each path
+ * an earlier `vX.Y.Z` tag published that `head` no longer has, since that deletion cannot be diffed.
+ * @param {(...args: string[]) => string} run git runner returning raw stdout
+ * @param {string} head
+ * @param {string[]} tags
+ * @returns {Array<[string, string]>}
+ */
+export function fullTreeChanges(run, head, tags) {
+    const tree = ref => run('ls-tree', '-r', '--name-only', '-z', ref).split('\0').filter(Boolean);
+    const current = new Set(tree(head));
+    const deleted = new Set();
+    for (const tag of tags.filter(t => /^v\d+\.\d+\.\d+$/.test(t))) {
+        for (const f of tree(tag)) if (!current.has(f)) deleted.add(f);
+    }
+    return [...[...current].map(f => ['A', f]), ...[...deleted].sort().map(f => ['D', f])]
+        .filter(([, f]) => !f.startsWith('.github/'));
+}
+
+/**
+ * Run `fn` over `items` with at most `limit` calls in flight.
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T) => Promise<R>} fn
+ * @returns {Promise<R[]>} results in the order of `items`
+ */
+export async function mapLimit(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    const worker = async () => {
+        while (next < items.length) {
+            const i = next++;
+            results[i] = await fn(items[i]);
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return results;
 }
 
 /**
@@ -182,25 +220,30 @@ export async function purgeRequest(url, fetchImpl = fetch) {
  * that must answer 404), re-purging each round: jsDelivr can keep resolving @latest to the previous
  * tag for a few minutes after a new one. A file counts as live only in a round where its purge and
  * the alias purge went through: one edge serving the new bytes says nothing about the other caches.
+ * Requests run `concurrency` at a time and no round starts after `deadlineMs`, so a stalled purge
+ * endpoint ends the run with the stale list instead of the job timeout killing it; the workflow's
+ * timeout-minutes covers the deadline plus one worst-case round.
  * @param {{ files: string[], expected: Object.<string, string|null>, purge: (file: string) => Promise<void>,
  *   purgeAlias: () => Promise<void>, fetchHash: (file: string) => Promise<string|null>,
- *   sleep: (ms: number) => Promise<void>, rounds?: number, waitMs?: number, log?: Function }} io
+ *   sleep: (ms: number) => Promise<void>, rounds?: number, waitMs?: number, concurrency?: number,
+ *   deadlineMs?: number, now?: () => number, log?: Function }} io
  * @returns {Promise<string[]>} files still not serving the committed state (empty on success)
  */
-export async function purgeUntilLive({ files, expected, purge, purgeAlias, fetchHash, sleep, rounds = 12, waitMs = 30000, log = console.log }) {
+export async function purgeUntilLive({ files, expected, purge, purgeAlias, fetchHash, sleep, rounds = 12, waitMs = 30000,
+    concurrency = 8, deadlineMs = 15 * 60 * 1000, now = Date.now, log = console.log }) {
+    const start = now();
     let pending = [...files];
     for (let round = 1; round <= rounds && pending.length; round++) {
+        if (now() - start > deadlineMs) {
+            log(`Stopping before round ${round}: past the ${Math.round(deadlineMs / 60000)}-minute deadline.`);
+            break;
+        }
         const aliasPurged = (await attempt(purgeAlias, 'purge @latest alias', log)) !== FAILED;
-        const purged = new Set();
-        for (const file of pending) {
-            if ((await attempt(() => purge(file), `purge ${file}`, log)) !== FAILED) purged.add(file);
-        }
+        const purges = await mapLimit(pending, concurrency, file => attempt(() => purge(file), `purge ${file}`, log));
         await sleep(waitMs);
-        const stale = [];
-        for (const file of pending) {
-            if (!aliasPurged || !purged.has(file)
-                || (await attempt(() => fetchHash(file), `fetch ${file}`, log)) !== expected[file]) stale.push(file);
-        }
+        const live = await mapLimit(pending.map((file, i) => [file, aliasPurged && purges[i] !== FAILED]), concurrency,
+            async ([file, purged]) => purged && (await attempt(() => fetchHash(file), `fetch ${file}`, log)) === expected[file]);
+        const stale = pending.filter((file, i) => !live[i]);
         log(`Round ${round}: ${pending.length - stale.length}/${pending.length} live on @latest.`);
         pending = stale;
     }
@@ -256,7 +299,7 @@ async function main() {
     const run = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
     const base = verifiedBase(run);
     if (!base) console.log(`${VERIFIED_REF} is missing; verifying every file.`);
-    const changes = changedFiles(run, base, head);
+    const changes = base ? changedFiles(run, base, head) : fullTreeChanges(run, head, listTags());
     const files = changes.map(([, f]) => f);
     console.log(`${tag}: ${files.length} changed files since ${base ? base.slice(0, 12) : 'the first commit'}.`);
     const markVerified = () => {

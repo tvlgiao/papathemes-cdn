@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { highestTag, nextTag, ensureTag, purgeUntilLive, purgeRequest, changedFiles, verifiedBase, blobSha256, cdnPath, sha256 } from './publish-latest.mjs';
+import { highestTag, nextTag, ensureTag, purgeUntilLive, purgeRequest, changedFiles, verifiedBase, blobSha256, cdnPath, sha256, fullTreeChanges, mapLimit } from './publish-latest.mjs';
 
 test('highestTag compares numerically and ignores non-semver tags', () => {
     assert.strictEqual(highestTag(['v1.0.9', 'v1.0.10', 'v1.0.2', 'release', 'v2']), 'v1.0.10');
@@ -197,7 +197,7 @@ test('purgeRequest resolves only when every provider purged the path', async () 
     await assert.rejects(purgeRequest('u', answer(200, { status: 'finished' })), /without a path/);
 });
 
-test('changedFiles returns byte-exact non-ASCII paths and type changes, leaves out .github, lists every file without a base', () => {
+test('changedFiles returns byte-exact non-ASCII paths and type changes, and leaves out .github', () => {
     const dir = mkdtempSync(join(tmpdir(), 'changed-files-'));
     // Force git's default path quoting, whatever the machine's config says.
     const run = (...args) => execFileSync('git', ['-C', dir, '-c', 'core.quotePath=true', ...args], { encoding: 'utf8' });
@@ -224,7 +224,6 @@ test('changedFiles returns byte-exact non-ASCII paths and type changes, leaves o
 
         assert.deepStrictEqual(changedFiles(run, c1, c2),
             [['D', 'a.js'], ['T', 'b.js'], ['A', 'dir/ünï cödé.js'], ['M', 'naïve.js']]);
-        assert.deepStrictEqual(changedFiles(run, undefined, c1), [['A', 'a.js'], ['A', 'b.js'], ['A', 'naïve.js']]);
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
@@ -314,4 +313,85 @@ test('cdnPath percent-encodes each segment and keeps the slashes', () => {
     assert.strictEqual(cdnPath('dir/ünï.js'), 'dir/%C3%BCn%C3%AF.js');
     assert.strictEqual(cdnPath('conditionalproductoptions/scripts/0.1.4/conditionalproductoptions.js'),
         'conditionalproductoptions/scripts/0.1.4/conditionalproductoptions.js');
+});
+
+test('fullTreeChanges lists every file of head and marks paths earlier tags published as deleted', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'full-tree-'));
+    const run = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+    const commit = (msg, tag) => {
+        run('add', '-A');
+        run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg);
+        if (tag) run('-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', tag, '-m', tag);
+    };
+    try {
+        run('init', '-q');
+        mkdirSync(join(dir, '.github'));
+        writeFileSync(join(dir, '.github', 'w.yml'), '1');
+        writeFileSync(join(dir, 'a.js'), '1');
+        writeFileSync(join(dir, 'b.js'), '1');
+        writeFileSync(join(dir, 'keep.js'), '1');
+        commit('c1', 'v1.0.0');
+        unlinkSync(join(dir, 'a.js'));
+        commit('c2', 'v1.0.1');
+        unlinkSync(join(dir, 'b.js'));
+        unlinkSync(join(dir, '.github', 'w.yml'));
+        writeFileSync(join(dir, 'new.js'), '1');
+        commit('c3', 'release-x');
+
+        assert.deepStrictEqual(fullTreeChanges(run, 'HEAD', ['v1.0.0', 'v1.0.1', 'release-x']),
+            [['A', 'keep.js'], ['A', 'new.js'], ['D', 'a.js'], ['D', 'b.js']]);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('mapLimit keeps at most `limit` calls in flight and returns results in order', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const out = await mapLimit([5, 1, 4, 2, 3, 0, 6], 3, async n => {
+        peak = Math.max(peak, ++inFlight);
+        await new Promise(r => setTimeout(r, n));
+        inFlight--;
+        return n * 10;
+    });
+    assert.deepStrictEqual(out, [50, 10, 40, 20, 30, 0, 60]);
+    assert.strictEqual(peak, 3);
+});
+
+test('purgeUntilLive purges concurrently, bounded by `concurrency`', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const files = Array.from({ length: 20 }, (_, i) => `f${i}.js`);
+    const stale = await purgeUntilLive({
+        files,
+        expected: Object.fromEntries(files.map(f => [f, 'new'])),
+        purge: async () => { peak = Math.max(peak, ++inFlight); await new Promise(r => setTimeout(r, 1)); inFlight--; },
+        purgeAlias: async () => {},
+        fetchHash: async () => 'new',
+        sleep: async () => {},
+        concurrency: 4,
+        log: () => {},
+    });
+    assert.deepStrictEqual(stale, []);
+    assert.strictEqual(peak, 4);
+});
+
+test('purgeUntilLive starts no round after the deadline and reports what is still stale', async () => {
+    let clock = 0;
+    let rounds = 0;
+    const stale = await purgeUntilLive({
+        files: ['a.js'],
+        expected: { 'a.js': 'new' },
+        purge: async () => {},
+        purgeAlias: async () => { rounds++; },
+        fetchHash: async () => 'old',
+        sleep: async ms => { clock += ms; },
+        rounds: 12,
+        waitMs: 60000,
+        deadlineMs: 150000,
+        now: () => clock,
+        log: () => {},
+    });
+    assert.deepStrictEqual(stale, ['a.js']);
+    assert.strictEqual(rounds, 3);
 });
