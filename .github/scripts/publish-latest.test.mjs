@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { highestTag, nextTag, ensureTag, purgeUntilLive } from './publish-latest.mjs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { highestTag, nextTag, ensureTag, purgeUntilLive, purgeRequest, changedFiles, verifiedBase } from './publish-latest.mjs';
 
 test('highestTag compares numerically and ignores non-semver tags', () => {
     assert.strictEqual(highestTag(['v1.0.9', 'v1.0.10', 'v1.0.2', 'release', 'v2']), 'v1.0.10');
@@ -132,20 +136,91 @@ test('purgeUntilLive re-purges only the files still stale until all are live', a
 });
 
 test('purgeUntilLive keeps going through failed purge and fetch requests', async () => {
+    let purges = 0;
+    let aliasPurges = 0;
     let fetches = 0;
     const stale = await purgeUntilLive({
         files: ['a.js'],
         expected: { 'a.js': 'new' },
-        purge: async () => { throw new Error('ECONNRESET'); },
-        purgeAlias: async () => { throw new Error('ETIMEDOUT'); },
-        fetchHash: async () => { if (++fetches < 3) throw new Error('socket hang up'); return 'new'; },
+        purge: async () => { if (++purges < 2) throw new Error('ECONNRESET'); },
+        purgeAlias: async () => { if (++aliasPurges < 3) throw new Error('ETIMEDOUT'); },
+        fetchHash: async () => { if (++fetches < 2) throw new Error('socket hang up'); return 'new'; },
         sleep: async () => {},
         rounds: 5,
         log: () => {},
     });
 
     assert.deepStrictEqual(stale, []);
-    assert.strictEqual(fetches, 3);
+    assert.strictEqual(aliasPurges, 4);
+});
+
+test('purgeUntilLive does not count a file live while its purge fails, even if one edge serves it', async () => {
+    const stale = await purgeUntilLive({
+        files: ['a.js', 'b.js'],
+        expected: { 'a.js': 'new', 'b.js': 'new' },
+        purge: async f => { if (f === 'b.js') throw new Error('HTTP 429'); },
+        purgeAlias: async () => {},
+        fetchHash: async () => 'new',
+        sleep: async () => {},
+        rounds: 3,
+        log: () => {},
+    });
+
+    assert.deepStrictEqual(stale, ['b.js']);
+});
+
+test('purgeUntilLive does not count any file live while the alias purge fails', async () => {
+    const stale = await purgeUntilLive({
+        files: ['a.js'],
+        expected: { 'a.js': 'new' },
+        purge: async () => {},
+        purgeAlias: async () => { throw new Error('HTTP 500'); },
+        fetchHash: async () => 'new',
+        sleep: async () => {},
+        rounds: 3,
+        log: () => {},
+    });
+
+    assert.deepStrictEqual(stale, ['a.js']);
+});
+
+/** fetch() stand-in answering one purge request. */
+const answer = (status, body) => async () => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+const purged = (entry) => ({ id: 'x', status: 'finished', paths: { '/gh/o/r@latest/a.js': entry } });
+
+test('purgeRequest resolves only when every provider purged the path', async () => {
+    await purgeRequest('u', answer(200, purged({ throttled: false, providers: { CF: true, FY: true } })));
+    await assert.rejects(purgeRequest('u', answer(429, {})), /HTTP 429/);
+    await assert.rejects(purgeRequest('u', answer(500, null)), /HTTP 500/);
+    await assert.rejects(purgeRequest('u', answer(200, purged({ throttled: true, providers: { CF: true, FY: true } }))), /throttled/);
+    await assert.rejects(purgeRequest('u', answer(200, purged({ throttled: false, providers: { CF: true, FY: false } }))), /provider/);
+    await assert.rejects(purgeRequest('u', answer(200, { status: 'finished' })), /without a path/);
+});
+
+test('changedFiles returns byte-exact non-ASCII paths, leaves out .github, and lists every file without a base', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'changed-files-'));
+    // Force git's default path quoting, whatever the machine's config says.
+    const run = (...args) => execFileSync('git', ['-C', dir, '-c', 'core.quotePath=true', ...args], { encoding: 'utf8' });
+    const commit = (msg) => { run('add', '-A'); run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg); return run('rev-parse', 'HEAD').trim(); };
+    try {
+        run('init', '-q');
+        mkdirSync(join(dir, '.github'));
+        writeFileSync(join(dir, '.github', 'w.yml'), '1');
+        writeFileSync(join(dir, 'a.js'), '1');
+        writeFileSync(join(dir, 'naïve.js'), '1');
+        const c1 = commit('c1');
+        mkdirSync(join(dir, 'dir'));
+        writeFileSync(join(dir, 'dir', 'ünï cödé.js'), '2');
+        writeFileSync(join(dir, 'naïve.js'), '2');
+        writeFileSync(join(dir, '.github', 'w.yml'), '2');
+        unlinkSync(join(dir, 'a.js'));
+        const c2 = commit('c2');
+
+        assert.deepStrictEqual(changedFiles(run, c1, c2), [['D', 'a.js'], ['A', 'dir/ünï cödé.js'], ['M', 'naïve.js']]);
+        assert.deepStrictEqual(changedFiles(run, undefined, c1), [['A', 'a.js'], ['A', 'naïve.js']]);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test('purgeUntilLive accepts a deleted file once it answers 404, not while it still serves', async () => {
@@ -184,4 +259,29 @@ test('purgeUntilLive reports the files that never went live', async () => {
     const { stale } = await runPurge({ files: ['a.js', 'b.js'], liveAfter: { 'a.js': 1, 'b.js': 99 }, rounds: 4 });
 
     assert.deepStrictEqual(stale, ['b.js']);
+});
+
+test('verifiedBase reads the verified ref and ignores tags when the ref does not exist', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'verified-base-'));
+    const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+    try {
+        const origin = join(dir, 'origin.git');
+        const work = join(dir, 'work');
+        git(dir, 'init', '-q', '--bare', origin);
+        git(dir, 'init', '-q', work);
+        writeFileSync(join(work, 'f'), '1');
+        git(work, 'add', 'f');
+        git(work, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'c1');
+        const c1 = git(work, 'rev-parse', 'HEAD').trim();
+        git(work, 'remote', 'add', 'origin', origin);
+        git(work, 'tag', 'v1.0.0');
+        git(work, 'push', '-q', 'origin', 'HEAD:main', 'v1.0.0');
+        const run = (...args) => git(work, ...args);
+
+        assert.strictEqual(verifiedBase(run), undefined);
+        git(work, 'push', '-q', 'origin', 'HEAD:refs/published/latest');
+        assert.strictEqual(verifiedBase(run), c1);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
 });

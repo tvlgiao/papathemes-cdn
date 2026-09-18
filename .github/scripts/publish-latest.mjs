@@ -85,6 +85,42 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
     throw new Error(`Could not tag ${head} after ${attempts} attempts`);
 }
 
+/**
+ * Files changed from `base` to `head`, or every file of `head` when there is no base, as
+ * [status, path] pairs (A, M or D) with byte-exact paths; `.github/` is left out.
+ * @param {(...args: string[]) => string} run git runner returning raw stdout
+ * @param {string|undefined} base
+ * @param {string} head
+ * @returns {Array<[string, string]>}
+ */
+export function changedFiles(run, base, head) {
+    // -z: without it git prints a non-ASCII path quoted and escaped, which `git show` cannot find.
+    const fields = base
+        ? run('diff', '--name-status', '--no-renames', '--diff-filter=AMD', '-z', base, head).split('\0')
+        : run('ls-tree', '-r', '--name-only', '-z', head).split('\0').flatMap(f => (f ? ['A', f] : []));
+    const pairs = [];
+    for (let i = 0; i + 1 < fields.length; i += 2) {
+        if (fields[i + 1]) pairs.push([fields[i], fields[i + 1]]);
+    }
+    return pairs.filter(([, f]) => !f.startsWith('.github/'));
+}
+
+/**
+ * The last commit whose changed files were verified live, or undefined when that ref does not exist.
+ * No tag is a safe fallback: a failed run leaves its tag behind, and diffing from it would skip files
+ * that never went live.
+ * @param {(...args: string[]) => string} run git runner returning raw stdout
+ * @returns {string|undefined}
+ */
+export function verifiedBase(run) {
+    try {
+        run('fetch', 'origin', `+${VERIFIED_REF}:${VERIFIED_REF}`);
+        return run('rev-parse', VERIFIED_REF).trim();
+    } catch {
+        return undefined;
+    }
+}
+
 /** First line of an error's message, for logs. */
 const firstLine = err => String((err && err.message) || err).split('\n')[0];
 
@@ -102,9 +138,28 @@ async function attempt(fn, what, log) {
 }
 
 /**
+ * Ask jsDelivr to purge `url`. Resolves only when every provider purged it: fetch() fulfills on an
+ * HTTP error, and a throttled purge answers 200.
+ * @param {string} url
+ * @param {typeof fetch} [fetchImpl]
+ * @returns {Promise<void>}
+ * @throws {Error} on a non-2xx status, a throttled path or a provider that did not purge
+ */
+export async function purgeRequest(url, fetchImpl = fetch) {
+    const resp = await fetchImpl(url, { signal: AbortSignal.timeout(20000) });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const body = await resp.json().catch(() => null);
+    const paths = Object.values((body && body.paths) || {});
+    if (!paths.length) throw new Error('purge answered without a path result');
+    if (paths.some(p => p.throttled)) throw new Error('purge throttled');
+    if (paths.some(p => Object.values(p.providers || {}).some(ok => !ok))) throw new Error('a provider did not purge');
+}
+
+/**
  * Purge `files` on @latest until each serves `expected[file]` (a sha256, or null for a deleted file
  * that must answer 404), re-purging each round: jsDelivr can keep resolving @latest to the previous
- * tag for a few minutes after a new one.
+ * tag for a few minutes after a new one. A file counts as live only in a round where its purge and
+ * the alias purge went through: one edge serving the new bytes says nothing about the other caches.
  * @param {{ files: string[], expected: Object.<string, string|null>, purge: (file: string) => Promise<void>,
  *   purgeAlias: () => Promise<void>, fetchHash: (file: string) => Promise<string|null>,
  *   sleep: (ms: number) => Promise<void>, rounds?: number, waitMs?: number, log?: Function }} io
@@ -113,12 +168,16 @@ async function attempt(fn, what, log) {
 export async function purgeUntilLive({ files, expected, purge, purgeAlias, fetchHash, sleep, rounds = 12, waitMs = 30000, log = console.log }) {
     let pending = [...files];
     for (let round = 1; round <= rounds && pending.length; round++) {
-        await attempt(purgeAlias, 'purge @latest alias', log);
-        for (const file of pending) await attempt(() => purge(file), `purge ${file}`, log);
+        const aliasPurged = (await attempt(purgeAlias, 'purge @latest alias', log)) !== FAILED;
+        const purged = new Set();
+        for (const file of pending) {
+            if ((await attempt(() => purge(file), `purge ${file}`, log)) !== FAILED) purged.add(file);
+        }
         await sleep(waitMs);
         const stale = [];
         for (const file of pending) {
-            if ((await attempt(() => fetchHash(file), `fetch ${file}`, log)) !== expected[file]) stale.push(file);
+            if (!aliasPurged || !purged.has(file)
+                || (await attempt(() => fetchHash(file), `fetch ${file}`, log)) !== expected[file]) stale.push(file);
         }
         log(`Round ${round}: ${pending.length - stale.length}/${pending.length} live on @latest.`);
         pending = stale;
@@ -172,24 +231,10 @@ async function main() {
 
     if (!tag) return;
 
-    // Diff from the last commit whose files were verified live, not from the previous tag: a failed
-    // run leaves its tag behind, and diffing from it would skip files that never went live.
-    let base;
-    try {
-        git('fetch', 'origin', `+${VERIFIED_REF}:${VERIFIED_REF}`);
-        base = git('rev-parse', VERIFIED_REF);
-    } catch {
-        const headTags = tagsAt(head);
-        base = highestTag(listTags().filter(t => !headTags.includes(t)));
-    }
-    // "A\tpath" / "M\tpath" / "D\tpath"; a deleted path must stop being served.
-    const changes = (base
-        ? git('diff', '--name-status', '--no-renames', '--diff-filter=AMD', base, head)
-        : git('ls-tree', '-r', '--name-only', head).split('\n').map(f => `A\t${f}`).join('\n'))
-        .split('\n')
-        .filter(Boolean)
-        .map(line => line.split('\t'))
-        .filter(([, f]) => f && !f.startsWith('.github/'));
+    const run = (...args) => execFileSync('git', args, { encoding: 'utf8' });
+    const base = verifiedBase(run);
+    if (!base) console.log(`${VERIFIED_REF} is missing; verifying every file.`);
+    const changes = changedFiles(run, base, head);
     const files = changes.map(([, f]) => f);
     console.log(`${tag}: ${files.length} changed files since ${base ? base.slice(0, 12) : 'the first commit'}.`);
     const markVerified = () => {
@@ -210,8 +255,8 @@ async function main() {
     const stale = await purgeUntilLive({
         files,
         expected,
-        purge: async f => { await fetch(`${PURGE}/${encodeURI(f)}`, { signal: timeout() }); },
-        purgeAlias: async () => { await fetch(PURGE, { signal: timeout() }); },
+        purge: f => purgeRequest(`${PURGE}/${encodeURI(f)}`),
+        purgeAlias: () => purgeRequest(PURGE),
         fetchHash: async f => {
             const resp = await fetch(CDN + encodeURI(f), { cache: 'no-store', signal: timeout() });
             if (resp.ok) return sha256(Buffer.from(await resp.arrayBuffer()));
