@@ -1,0 +1,32 @@
+name: publish-latest
+
+# jsDelivr serves @latest from the newest tag once this repo has any tag, so a push to main is
+# not live on @latest until it is tagged. Tag every push and wait until @latest serves it.
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# One run at a time: parallel runs would pick the same next tag.
+concurrency:
+  group: publish-latest
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Unit tests
+        run: node --test .github/scripts/publish-latest.test.mjs
+
+      - name: Tag main and wait until @latest serves it
+        run: node .github/scripts/publish-latest.mjs
