@@ -109,10 +109,10 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
 /**
  * Files to publish from `base` to `head` as [status, path] pairs (A, M, T or D) with byte-exact
  * paths; `.github/` is left out. T (a file turned into a symlink or back) is served differently,
- * so it is published like M. Besides the net diff, every path touched by a commit after `base` on
- * `head` or on a tag published after `base` is included (M if `head` has it, else D): a tagged
- * commit whose run failed may have left its bytes cached for a path that a later commit restored,
- * or that a force push to main took out of `head`'s history, and the net diff shows neither.
+ * so it is published like M. Besides the net diff, every path whose content differs between `head`
+ * and a tag published after `base` is included (M if `head` has it, else D): @latest served that
+ * tag's tree even if its run failed, whether the tag sits on `head`'s history, on history a force
+ * push removed, or on an unrelated one, and the net diff from `base` shows none of that.
  * @param {(...args: string[]) => string} run git runner returning raw stdout
  * @param {string} base
  * @param {string} head
@@ -120,20 +120,21 @@ export function ensureTag({ head, fetchTags, listTags, tagsAt, createAndPush, is
  */
 export function changedFiles(run, base, head) {
     // -z: without it git prints a non-ASCII path quoted and escaped, which `git show` cannot find.
-    const fields = run('diff', '--name-status', '--no-renames', '--diff-filter=AMDT', '-z', base, head).split('\0');
-    const status = new Map();
-    for (let i = 0; i + 1 < fields.length; i += 2) {
-        if (fields[i + 1]) status.set(fields[i + 1], fields[i]);
-    }
+    const nameStatus = (from, to) => {
+        const fields = run('diff', '--name-status', '--no-renames', '--diff-filter=AMDT', '-z', from, to).split('\0');
+        const pairs = [];
+        for (let i = 0; i + 1 < fields.length; i += 2) {
+            if (fields[i + 1]) pairs.push([fields[i], fields[i + 1]]);
+        }
+        return pairs;
+    };
+    const status = new Map(nameStatus(base, head).map(([s, f]) => [f, s]));
     const tagList = (...args) => run('tag', '-l', 'v*', ...args).split('\n').map(t => t.trim()).filter(Boolean);
     const baseTop = highestTag(tagList('--merged', base));
     // Semver tags above the highest one `base` contains (highestTag ignores any other tag).
     const later = tagList().filter(t => t !== baseTop && highestTag(baseTop ? [t, baseTop] : [t]) === t);
-    const touched = run('log', '--no-renames', '--diff-merges=first-parent', '--name-only', '--format=', '-z', head, ...later, `^${base}`)
-        .split('\0').filter(Boolean);
-    if (touched.some(f => !status.has(f))) {
-        const inHead = new Set(run('ls-tree', '-r', '--name-only', '-z', head).split('\0').filter(Boolean));
-        for (const f of touched) if (!status.has(f)) status.set(f, inHead.has(f) ? 'M' : 'D');
+    for (const tag of later) {
+        for (const [s, f] of nameStatus(tag, head)) if (!status.has(f)) status.set(f, s === 'D' ? 'D' : 'M');
     }
     return [...status].map(([f, s]) => [s, f])
         .sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
@@ -157,6 +158,30 @@ export function fullTreeChanges(run, head, tags) {
     }
     return [...[...current].map(f => ['A', f]), ...[...deleted].sort().map(f => ['D', f])]
         .filter(([, f]) => !f.startsWith('.github/'));
+}
+
+/**
+ * Move the verified ref to `head`, unless a higher tag appeared during the run: @latest then serves
+ * that tag, so this run's checks did not prove what @latest serves, and the ref stays where it is
+ * for the next run to re-check from.
+ * @param {{ head: string, tag: string, fetchTags: () => void, listTags: () => string[],
+ *   tagsAt: (sha: string) => string[], pushRef: () => void, log?: Function }} io
+ * @returns {boolean} whether the ref was moved
+ */
+export function recordVerified({ head, tag, fetchTags, listTags, tagsAt, pushRef, log = console.log }) {
+    fetchTags();
+    const top = highestTag(listTags());
+    if (!tagsAt(head).includes(top)) {
+        log(`::notice::${top} was tagged during this run, so @latest serves it rather than ${tag}; ${VERIFIED_REF} stays for the next run to re-check.`);
+        return false;
+    }
+    try {
+        pushRef();
+        return true;
+    } catch (err) {
+        log(`Could not record ${head.slice(0, 7)} as verified: ${firstLine(err)}`);
+        return false;
+    }
 }
 
 /**
@@ -317,13 +342,14 @@ async function main() {
     const changes = base ? changedFiles(run, base, head) : fullTreeChanges(run, head, listTags());
     const files = changes.map(([, f]) => f);
     console.log(`${tag}: ${files.length} changed files since ${base ? base.slice(0, 12) : 'the first commit'}.`);
-    const markVerified = () => {
-        try {
-            git('push', '--force', 'origin', `${head}:${VERIFIED_REF}`);
-        } catch (err) {
-            console.warn(`Could not record ${head.slice(0, 7)} as verified: ${firstLine(err)}`);
-        }
-    };
+    const markVerified = () => recordVerified({
+        head,
+        tag,
+        fetchTags: () => git('fetch', '--tags', '--force', 'origin'),
+        listTags,
+        tagsAt,
+        pushRef: () => git('push', '--force', 'origin', `${head}:${VERIFIED_REF}`),
+    });
     if (!files.length) {
         markVerified();
         return;
@@ -348,8 +374,7 @@ async function main() {
     if (stale.length) {
         throw new Error(`@latest still serves old bytes for ${stale.length} files:\n${stale.join('\n')}`);
     }
-    markVerified();
-    console.log(`@latest serves ${tag} for all ${files.length} changed files.`);
+    if (markVerified()) console.log(`@latest serves ${tag} for all ${files.length} changed files.`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

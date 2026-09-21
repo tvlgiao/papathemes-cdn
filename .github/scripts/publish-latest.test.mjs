@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { highestTag, nextTag, ensureTag, purgeUntilLive, purgeRequest, changedFiles, verifiedBase, blobSha256, cdnPath, sha256, fullTreeChanges, mapLimit } from './publish-latest.mjs';
+import { highestTag, nextTag, ensureTag, purgeUntilLive, purgeRequest, changedFiles, verifiedBase, blobSha256, cdnPath, sha256, fullTreeChanges, mapLimit, recordVerified } from './publish-latest.mjs';
 
 test('highestTag compares numerically and ignores non-semver tags', () => {
     assert.strictEqual(highestTag(['v1.0.9', 'v1.0.10', 'v1.0.2', 'release', 'v2']), 'v1.0.10');
@@ -396,28 +396,34 @@ test('purgeUntilLive starts no round after the deadline and reports what is stil
     assert.strictEqual(rounds, 3);
 });
 
-test('changedFiles keeps paths an intermediate commit touched even when the net diff does not show them', () => {
+test('changedFiles re-verifies paths a later tag served even when the net diff does not show them', () => {
     const dir = mkdtempSync(join(tmpdir(), 'touched-'));
     const run = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
-    const commit = (msg) => {
+    const commit = (msg, tag) => {
         run('add', '-A');
         run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg);
+        if (tag) run('tag', tag);
         return run('rev-parse', 'HEAD').trim();
     };
     try {
         run('init', '-q');
         writeFileSync(join(dir, 'foo.js'), 'verified');
         writeFileSync(join(dir, 'keep.js'), '1');
-        const base = commit('verified');
+        writeFileSync(join(dir, 'untagged.js'), '1');
+        const base = commit('verified', 'v1.0.0');
         // A tagged commit whose run failed: foo.js may be cached with these bytes; tmp.js was served.
         writeFileSync(join(dir, 'foo.js'), 'failed run');
         writeFileSync(join(dir, 'tmp.js'), '1');
-        commit('failed');
-        // The next commit restores foo.js and drops tmp.js: the net diff from base shows neither.
+        commit('failed', 'v1.0.1');
+        // An untagged change is never served by @latest, so reverting it needs no re-check.
+        writeFileSync(join(dir, 'untagged.js'), '2');
+        commit('untagged');
+        // The next commit restores foo.js and untagged.js and drops tmp.js: the net diff shows none.
         writeFileSync(join(dir, 'foo.js'), 'verified');
+        writeFileSync(join(dir, 'untagged.js'), '1');
         unlinkSync(join(dir, 'tmp.js'));
         writeFileSync(join(dir, 'other.js'), '1');
-        const head = commit('restore');
+        const head = commit('restore', 'v1.0.2');
 
         assert.deepStrictEqual(changedFiles(run, base, head), [['M', 'foo.js'], ['A', 'other.js'], ['D', 'tmp.js']]);
     } finally {
@@ -455,4 +461,78 @@ test('changedFiles includes paths of tags published after base that a force push
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+test('changedFiles re-verifies every path an orphan-history tag served differently from head', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orphan-'));
+    const run = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+    const commit = (msg, tag) => {
+        run('add', '-A');
+        run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg);
+        if (tag) run('tag', tag);
+        return run('rev-parse', 'HEAD').trim();
+    };
+    try {
+        run('init', '-q');
+        writeFileSync(join(dir, 'keep.js'), '1');
+        writeFileSync(join(dir, 'foo.js'), '1');
+        const base = commit('verified', 'v1.0.0');
+        const branch = run('rev-parse', '--abbrev-ref', 'HEAD').trim();
+        // A force-pushed orphan history without keep.js and foo.js, tagged and never verified:
+        // @latest answered 404 for both while it pointed there.
+        run('checkout', '-q', '--orphan', 'orphan');
+        run('rm', '-rqf', '.');
+        writeFileSync(join(dir, 'other.js'), '1');
+        commit('orphan', 'v1.0.1');
+        run('checkout', '-q', '-f', branch);
+        writeFileSync(join(dir, 'bar.js'), '1');
+        const head = commit('restored main', 'v1.0.2');
+
+        assert.deepStrictEqual(changedFiles(run, base, head),
+            [['A', 'bar.js'], ['M', 'foo.js'], ['M', 'keep.js'], ['D', 'other.js']]);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+/** recordVerified I/O where the remote gains `racerTag` on another commit before the re-fetch. */
+function verifyIo({ racerTag, pushFails } = {}) {
+    const remote = { 'v1.0.6': 'head' };
+    if (racerTag) remote[racerTag] = 'other';
+    let local = { 'v1.0.6': 'head' };
+    const pushes = [];
+    const logs = [];
+    return {
+        pushes,
+        logs,
+        io: {
+            head: 'head',
+            tag: 'v1.0.6',
+            fetchTags: () => { local = { ...remote }; },
+            listTags: () => Object.keys(local),
+            tagsAt: sha => Object.keys(local).filter(t => local[t] === sha),
+            pushRef: () => { if (pushFails) throw new Error('rejected'); pushes.push('head'); },
+            log: m => logs.push(m),
+        },
+    };
+}
+
+test('recordVerified moves the ref when the highest tag still points at head', () => {
+    const v = verifyIo();
+    assert.strictEqual(recordVerified(v.io), true);
+    assert.deepStrictEqual(v.pushes, ['head']);
+});
+
+test('recordVerified re-reads the tags and leaves the ref when a higher tag appeared during the run', () => {
+    const v = verifyIo({ racerTag: 'v1.0.7' });
+    assert.strictEqual(recordVerified(v.io), false);
+    assert.deepStrictEqual(v.pushes, []);
+    assert.match(v.logs.join(' '), /v1\.0\.7 was tagged during this run/);
+});
+
+test('recordVerified ignores a newer non-semver tag and reports a failed push without throwing', () => {
+    assert.strictEqual(recordVerified(verifyIo({ racerTag: 'release-x' }).io), true);
+    const v = verifyIo({ pushFails: true });
+    assert.strictEqual(recordVerified(v.io), false);
+    assert.match(v.logs.join(' '), /Could not record head as verified: rejected/);
 });
